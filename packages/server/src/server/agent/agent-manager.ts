@@ -2086,7 +2086,7 @@ export class AgentManager {
     // A caller that archives many agents at once supplies one snapshot. Without one the scan
     // happens here, after the parent is archived, so a child that opened its tab in between is
     // still detached instead of archived.
-    const records = cascade?.activeRecords ?? (await registry.list());
+    const records = cascade?.activeRecords ?? (await registry.listActive());
     for (const record of records) {
       if (record.archivedAt) {
         continue;
@@ -2556,7 +2556,8 @@ export class AgentManager {
 
   async unarchiveSnapshotByHandle(handle: AgentPersistenceHandle): Promise<void> {
     const registry = this.requireRegistry();
-    const records = await registry.list();
+    // Restoring an archived provider session is an explicit recovery operation.
+    const records = await registry.listAll();
     const matched = records.find(
       (record) =>
         record.persistence?.provider === handle.provider &&
