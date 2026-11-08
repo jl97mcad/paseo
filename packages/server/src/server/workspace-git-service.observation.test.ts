@@ -6,7 +6,10 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { CheckoutSnapshotFacts, CheckoutStatusGit } from "../utils/checkout-git.js";
 import { CheckoutDiffManager } from "./checkout-diff-manager.js";
 import type { FileObserver } from "./file-observer/index.js";
-import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import {
+  WORKSPACE_GIT_TARGET_IDLE_TTL_MS,
+  WorkspaceGitServiceImpl,
+} from "./workspace-git-service.js";
 
 const REPO_CWD = path.resolve("/tmp/paseo-observation-repo");
 const GIT_DIR = path.join(REPO_CWD, ".git");
@@ -425,6 +428,37 @@ describe("WorkspaceGitService checkout observation", () => {
     });
 
     service.dispose();
+  });
+
+  test("releases an unobserved snapshot target after the idle window", async () => {
+    const service = createService(createWatcherHarness());
+    try {
+      await service.getSnapshot(REPO_CWD);
+      expect(service.getMetrics().workspaceTargetCount).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_TARGET_IDLE_TTL_MS);
+
+      expect(service.getMetrics().workspaceTargetCount).toBe(0);
+    } finally {
+      await service.dispose();
+    }
+  });
+
+  test("keeps a subscribed target past the idle window", async () => {
+    const service = createService(createWatcherHarness());
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await vi.waitFor(() => {
+        expect(service.getMetrics().workspaceRefreshInFlightCount).toBe(0);
+      });
+
+      await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_TARGET_IDLE_TTL_MS);
+
+      expect(service.getMetrics().workspaceTargetCount).toBe(1);
+    } finally {
+      subscription.unsubscribe();
+      await service.dispose();
+    }
   });
 
   test("a tracked edit refreshes summary and active uncommitted diff without structural or forge work", async () => {
