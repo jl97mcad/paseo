@@ -86,6 +86,9 @@ const WORKSPACE_GIT_WATCH_DEBOUNCE_MS = 1_000;
 // A target outlives its last listener this long, so a reconnecting client reuses its snapshot
 // and watchers instead of re-reading every checkout.
 const WORKSPACE_GIT_RELEASE_GRACE_MS = 90_000;
+// Read-only snapshots create a target with no listener to release it. Keep the cache long enough
+// for a burst of related reads, then let the next read pay for a fresh snapshot.
+export const WORKSPACE_GIT_TARGET_IDLE_TTL_MS = 5 * 60_000;
 export const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
 const FETCH_METADATA_ECHO_TTL_MS = 5_000;
 export const WORKSPACE_GIT_OBSERVATION_REENSURE_INTERVAL_MS = 60_000;
@@ -849,6 +852,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       await this.resumeWorkspaceIfFolderRestored(target);
     }
     if (!request.force && target.latestSnapshot) {
+      this.scheduleWorkspaceTargetRelease(target);
       return target.latestSnapshot;
     }
 
@@ -3423,6 +3427,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       if (state.status === "in-flight" && state.promise === promise) {
         target.refreshState = { status: "idle" };
       }
+      this.scheduleWorkspaceTargetRelease(target);
     });
     this.pendingRefreshes.add(promise);
     target.refreshState = {
@@ -4177,6 +4182,43 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       clearTimeout(target.releaseTimer);
       target.releaseTimer = null;
     }
+  }
+
+  // Shares `releaseTimer` with the listener grace above: a pending grace or idle release is left
+  // to run, so a read never extends a grace and the idle clock counts from the first quiet read.
+  private scheduleWorkspaceTargetRelease(target: WorkspaceGitTarget): void {
+    if (target.closed || this.workspaceTargets.get(target.cwd) !== target) {
+      return;
+    }
+    if (target.listeners.size > 0 || target.refreshState.status !== "idle") {
+      return;
+    }
+    if (target.releaseTimer) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      target.releaseTimer = null;
+      if (!this.isIdleUnobservedWorkspaceTarget(target)) {
+        return;
+      }
+      this.removeWorkspaceTarget(target);
+    }, WORKSPACE_GIT_TARGET_IDLE_TTL_MS);
+    timer.unref();
+    target.releaseTimer = timer;
+  }
+
+  private isIdleUnobservedWorkspaceTarget(target: WorkspaceGitTarget): boolean {
+    return (
+      !target.closed &&
+      this.workspaceTargets.get(target.cwd) === target &&
+      target.listeners.size === 0 &&
+      target.refreshState.status === "idle" &&
+      target.debounceTimer === null &&
+      target.pendingDebounceRequest === null &&
+      target.observationReensureTimer === null &&
+      target.observationSetupPromise === null &&
+      target.forgePrStatusPollSubscription === null
+    );
   }
 
   private removeWorkspaceTarget(target: WorkspaceGitTarget): void {
