@@ -37,6 +37,8 @@ export function asAgentManager(stub: {
   return createStub<SessionOptions["agentManager"]>({
     listProviderSubagentActivity: () => [],
     getRetiredInternalAgent: () => null,
+    // Archive reads one active-record snapshot; tests without agent storage have none.
+    listActiveAgentRecords: async () => [],
     ...stub,
   });
 }
