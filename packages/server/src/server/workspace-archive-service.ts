@@ -181,6 +181,9 @@ async function archiveByScopeWithPriority(
       request.requestId,
     );
 
+    // Past this point the records are archived and the directory is on its way out, so the
+    // main repo's listing must be refreshed even if removal fails.
+    completed = true;
     if (target.backing !== null) {
       const removal = await maybeRemoveDirectory(
         dependencies,
@@ -192,7 +195,6 @@ async function archiveByScopeWithPriority(
       directoryLeftBehind = removal.directoryLeftBehind;
     }
 
-    completed = true;
     return {
       archivedAgentIds: Array.from(archivedAgents),
       archivedWorkspaceIds,
