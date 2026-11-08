@@ -713,6 +713,7 @@ test("Git observation targets exclude archived records without hydrating app des
     cwd: `/workspace/${id}`,
     kind: "local_checkout",
     displayName: id,
+    isPaseoOwnedWorktree: id === "observed",
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt,
@@ -748,7 +749,13 @@ test("Git observation targets exclude archived records without hydrating app des
     isProviderVisibleToClient: () => true,
   });
   expect(await directory.listObservationTargets()).toEqual([
-    { id: "observed", workspaceDirectory: "/workspace/observed", workspaceKind: "local_checkout" },
+    {
+      id: "observed",
+      workspaceDirectory: "/workspace/observed",
+      workspaceKind: "local_checkout",
+      updatedAt: NOW,
+      isPaseoOwnedWorktree: true,
+    },
   ]);
 });
 

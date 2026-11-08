@@ -166,6 +166,15 @@ function activeWorkspaceRecords(
   );
 }
 
+/** An active workspace plus the cheap facts git-observation liveness needs. */
+export interface WorkspaceObservationTarget extends Pick<
+  WorkspaceDescriptorPayload,
+  "id" | "workspaceDirectory" | "workspaceKind"
+> {
+  updatedAt: string;
+  isPaseoOwnedWorktree: boolean;
+}
+
 export class WorkspaceDirectory {
   private readonly archivingByWorkspaceId = new Map<string, string>();
   /**
@@ -593,9 +602,7 @@ export class WorkspaceDirectory {
       }));
   }
 
-  async listObservationTargets(): Promise<
-    Pick<WorkspaceDescriptorPayload, "id" | "workspaceDirectory" | "workspaceKind">[]
-  > {
+  async listObservationTargets(): Promise<WorkspaceObservationTarget[]> {
     const [workspaces, projects] = await Promise.all([
       this.deps.workspaceRegistry.list(),
       this.deps.projectRegistry.list(),
@@ -604,6 +611,8 @@ export class WorkspaceDirectory {
       id: workspace.workspaceId,
       workspaceDirectory: workspace.cwd,
       workspaceKind: workspace.kind,
+      updatedAt: workspace.updatedAt,
+      isPaseoOwnedWorktree: workspace.isPaseoOwnedWorktree,
     }));
   }
 
