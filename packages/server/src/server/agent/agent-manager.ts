@@ -1900,7 +1900,7 @@ export class AgentManager {
 
   private runtimeHasNoPendingWork(agent: LiveManagedAgent): boolean {
     return (
-      agent.lifecycle === "idle" &&
+      (agent.lifecycle === "idle" || agent.lifecycle === "error") &&
       !agent.internal &&
       agent.activeForegroundTurnId === null &&
       !this.runs.hasRun(agent.id) &&
