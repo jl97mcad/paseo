@@ -328,6 +328,12 @@ export type AgentAttentionCallback = (params: {
 
 export type AgentArchivedCallback = (agentId: string) => Promise<void> | void;
 
+export interface ArchiveCascadeOptions {
+  // Active stored records the caller already read, so the parent/child cascade does not scan
+  // them again. Candidates are re-read from storage before they are archived or detached.
+  activeRecords?: readonly StoredAgentRecord[];
+}
+
 export interface ProviderAvailability {
   provider: AgentProvider;
   available: boolean;
@@ -2196,13 +2202,24 @@ export class AgentManager {
     }
   }
 
-  async archiveAgent(agentId: string): Promise<{ archivedAt: string }> {
-    return this.runLifecycleMutation(agentId, () => this.archiveAgentUnlocked(agentId));
+  async archiveAgent(
+    agentId: string,
+    options?: ArchiveCascadeOptions,
+  ): Promise<{ archivedAt: string }> {
+    return this.runLifecycleMutation(agentId, () =>
+      this.archiveAgentUnlocked(agentId, undefined, options),
+    );
+  }
+
+  /** Active stored records, for a caller that archives many agents in one request. */
+  async listActiveAgentRecords(): Promise<StoredAgentRecord[]> {
+    return this.registry ? await this.registry.listActive() : [];
   }
 
   private async archiveAgentUnlocked(
     agentId: string,
     requestedArchivedAt?: string,
+    cascade?: ArchiveCascadeOptions,
   ): Promise<{ archivedAt: string }> {
     const agent = this.requireAgent(agentId);
     if (agent.internal) {
@@ -2219,7 +2236,7 @@ export class AgentManager {
       await this.closeAgentRuntime(agentId);
       await this.deleteAgentState(agentId);
       this.retireInternalAgent({ record, lastMessage });
-      await this.cascadeArchiveChildren(record);
+      await this.cascadeArchiveChildren(record, cascade);
       return { archivedAt };
     }
     if (!this.registry) {
@@ -2240,7 +2257,7 @@ export class AgentManager {
     await this.syncNativeArchiveState(stored.provider, stored.persistence, "archive");
     this.discardRetainedAgentState(agentId);
 
-    await this.cascadeArchiveChildren(stored);
+    await this.cascadeArchiveChildren(stored, cascade);
 
     return { archivedAt };
   }
@@ -2251,13 +2268,17 @@ export class AgentManager {
   // handoff agents omit this label, so they stand outside the cascade.
   private async cascadeArchiveChildren(
     parent: Pick<StoredAgentRecord, "id" | "workspaceId">,
+    cascade?: ArchiveCascadeOptions,
   ): Promise<void> {
     const registry = this.registry;
     if (!registry) {
       return;
     }
     const parentAgentId = parent.id;
-    const records = await registry.listActive();
+    // A caller that archives many agents at once supplies one snapshot. Without one the scan
+    // happens here, after the parent is archived, so a child that opened its tab in between is
+    // still detached instead of archived.
+    const records = cascade?.activeRecords ?? (await registry.listActive());
     for (const record of records) {
       if (record.archivedAt) {
         continue;
@@ -2284,9 +2305,9 @@ export class AgentManager {
             this.dispatchStoredAgentState(detached.record);
           }
         } else if (this.agents.has(currentChild.id)) {
-          await this.archiveAgentUnlocked(currentChild.id);
+          await this.archiveAgentUnlocked(currentChild.id, undefined, cascade);
         } else {
-          await this.archiveSnapshotUnlocked(currentChild.id, new Date().toISOString());
+          await this.archiveSnapshotUnlocked(currentChild.id, new Date().toISOString(), cascade);
         }
       });
     }
@@ -2302,7 +2323,7 @@ export class AgentManager {
         if (!current || getParentAgentIdFromLabels(current.labels) !== parentAgentId) {
           return;
         }
-        await this.archiveAgentUnlocked(current.id);
+        await this.archiveAgentUnlocked(current.id, undefined, cascade);
       });
     }
   }
@@ -2820,21 +2841,26 @@ export class AgentManager {
     this.dispatchStoredAgentState(nextRecord);
   }
 
-  async archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord> {
+  async archiveSnapshot(
+    agentId: string,
+    archivedAt: string,
+    options?: ArchiveCascadeOptions,
+  ): Promise<StoredAgentRecord> {
     return this.runLifecycleMutation(agentId, () =>
-      this.archiveSnapshotUnlocked(agentId, archivedAt),
+      this.archiveSnapshotUnlocked(agentId, archivedAt, options),
     );
   }
 
   private async archiveSnapshotUnlocked(
     agentId: string,
     archivedAt: string,
+    cascade?: ArchiveCascadeOptions,
   ): Promise<StoredAgentRecord> {
     const registry = this.requireRegistry();
     // A stored-only archive can have waited behind a persisted resume. Reuse the
     // live archive transition so its newly acquired runtime is closed as well.
     if (this.agents.has(agentId)) {
-      await this.archiveAgentUnlocked(agentId, archivedAt);
+      await this.archiveAgentUnlocked(agentId, archivedAt, cascade);
       const archivedRecord = await registry.get(agentId);
       if (!archivedRecord) throw new Error(`Agent not found: ${agentId}`);
       return archivedRecord;
@@ -2853,7 +2879,7 @@ export class AgentManager {
     if (!nextRecord.internal) this.dispatchStoredAgentState(nextRecord);
 
     await this.fireAgentArchived(agentId);
-    await this.cascadeArchiveChildren(record);
+    await this.cascadeArchiveChildren(record, cascade);
 
     return nextRecord;
   }
