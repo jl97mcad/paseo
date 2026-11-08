@@ -32,6 +32,11 @@ interface ProjectionOptions {
   createdAt?: string;
   internal?: boolean;
   /**
+   * Stored status override for a runtime that closed without changing what its
+   * record reports, such as a reaped failure. Absent means the agent's lifecycle.
+   */
+  lastStatus?: StoredAgentRecord["lastStatus"];
+  /**
    * Archive timestamp, supplied by a caller holding the stored record. A live
    * managed agent cannot know this: an archived agent is resumed back into
    * memory to serve a history read, so being in the manager is not evidence
@@ -92,7 +97,7 @@ export function toStoredAgentRecord(
     lastUserMessageAt: agent.lastUserMessageAt ? agent.lastUserMessageAt.toISOString() : null,
     title: options?.title ?? null,
     labels: agent.labels,
-    lastStatus: agent.lifecycle,
+    lastStatus: options?.lastStatus ?? agent.lifecycle,
     lastModeId: agent.currentModeId ?? config?.modeId ?? null,
     config: config ?? null,
     launchEnv: agent.launchEnv ? { ...agent.launchEnv } : undefined,
