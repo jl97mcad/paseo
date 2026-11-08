@@ -2219,7 +2219,12 @@ export class AgentManager {
           this.collectingRuntimes.add(agent.id);
           try {
             return await this.runLifecycleMutation(agent.id, () =>
-              this.closeAgentRuntime(agent.id, () => isEligible() && revalidate()),
+              this.closeAgentRuntime(agent.id, {
+                canClose: () => isEligible() && revalidate(),
+                // The idle clock releases the process, not the outcome. A reaped failure
+                // keeps reporting as a failure until the agent is resumed.
+                keepErrorStatus: true,
+              }),
             );
           } finally {
             this.collectingRuntimes.delete(agent.id);
@@ -2267,7 +2272,10 @@ export class AgentManager {
     return close;
   }
 
-  private async closeAgentRuntime(agentId: string, canClose?: () => boolean): Promise<boolean> {
+  private async closeAgentRuntime(
+    agentId: string,
+    options?: { canClose?: () => boolean; keepErrorStatus?: boolean },
+  ): Promise<boolean> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
       {
@@ -2282,7 +2290,7 @@ export class AgentManager {
       "agent.manager.close.start",
     );
     await this.drainSessionEvents(agentId);
-    if (canClose && !canClose()) return false;
+    if (options?.canClose && !options.canClose()) return false;
     // Retain ownership until shutdown succeeds. A failed close may still own a
     // native writer, so publishing a resumable closed snapshot would orphan it.
     await agent.session.close();
@@ -2291,10 +2299,12 @@ export class AgentManager {
     // close() drops the session's subscribers before the provider could report an empty list.
     this.clearProviderBackgroundWork(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
+    const lastStatus =
+      options?.keepErrorStatus && agent.lifecycle === "error" ? agent.lifecycle : undefined;
 
     let persistError: unknown;
     try {
-      await this.persistSnapshot(closedAgent);
+      await this.persistSnapshot(closedAgent, { lastStatus });
     } catch (error) {
       persistError = error;
     }
@@ -5051,7 +5061,11 @@ export class AgentManager {
 
   private async persistSnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      lastStatus?: StoredAgentRecord["lastStatus"];
+    },
   ): Promise<void> {
     if (!this.registry) {
       return;

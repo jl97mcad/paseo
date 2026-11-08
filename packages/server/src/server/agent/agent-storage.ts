@@ -401,7 +401,11 @@ export class AgentStorage {
 
   async applySnapshot(
     agent: ManagedAgent,
-    options?: { title?: string | null; internal?: boolean },
+    options?: {
+      title?: string | null;
+      internal?: boolean;
+      lastStatus?: StoredAgentRecord["lastStatus"];
+    },
   ): Promise<void> {
     await this.load();
     const hasTitleOverride =
@@ -413,6 +417,7 @@ export class AgentStorage {
         title: hasTitleOverride ? (options?.title ?? null) : (existing?.title ?? null),
         createdAt: existing?.createdAt,
         internal: hasInternalOverride ? options?.internal : (agent.internal ?? existing?.internal),
+        lastStatus: options?.lastStatus,
       });
 
       // Preserve soft-delete/archive status across snapshot flushes. The
