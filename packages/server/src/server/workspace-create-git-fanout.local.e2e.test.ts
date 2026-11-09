@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterEach, expect, test } from "vitest";
+import { afterAll, afterEach, expect, test } from "vitest";
 import type { WorkspaceDescriptorPayload } from "@getpaseo/protocol/messages";
 
 import { DaemonClient } from "./test-utils/daemon-client.js";
@@ -22,6 +22,10 @@ import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
 const SIBLING_COUNT = 100;
 const CREATED_AT = "2026-08-07T00:00:00.000Z";
 const originalMaxProcessesPerSecond = process.env.PASEO_GIT_MAX_PROCESSES_PER_SECOND;
+// These tests assert the main-thread Git command ledger, so the daemon under
+// test reads in-thread. The pooled path has its own assertion below.
+const originalGitWorkerCount = process.env.PASEO_GIT_WORKER_COUNT;
+process.env.PASEO_GIT_WORKER_COUNT = "0";
 
 let daemon: TestPaseoDaemon | null = null;
 let client: DaemonClient | null = null;
@@ -41,6 +45,14 @@ afterEach(async () => {
     process.env.PASEO_GIT_MAX_PROCESSES_PER_SECOND = originalMaxProcessesPerSecond;
   }
   configureGitProcessPolicy(resolveGitProcessPolicy({ env: process.env }));
+});
+
+afterAll(() => {
+  if (originalGitWorkerCount === undefined) {
+    delete process.env.PASEO_GIT_WORKER_COUNT;
+  } else {
+    process.env.PASEO_GIT_WORKER_COUNT = originalGitWorkerCount;
+  }
 });
 
 function git(cwd: string, ...args: string[]): string {
@@ -163,6 +175,44 @@ test("quiet observed workspaces spawn no git commands beyond the old self-heal i
   const idle = stopGitCommandMetrics();
 
   expect(idle.submissions).toEqual([]);
+}, 90_000);
+
+async function waitForCondition(
+  description: string,
+  condition: () => boolean,
+  timeoutMs = 60_000,
+): Promise<void> {
+  const startedAt = Date.now();
+  while (!condition()) {
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(`Timed out waiting for ${description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+test("a pooled quiet workspace dispatches no worker requests", async () => {
+  process.env.PASEO_GIT_WORKER_COUNT = "2";
+  try {
+    await startObservedFixture(2);
+    const gitWorkerStats = () => {
+      if (!daemon) throw new Error("Daemon is not running");
+      return daemon.daemon.getGitWorkerStats();
+    };
+    await settleGitCommands();
+    await waitForCondition(
+      "the pooled snapshot reads to finish",
+      () =>
+        gitWorkerStats().dispatched > 0 &&
+        gitWorkerStats().inFlight === 0 &&
+        gitWorkerStats().queued === 0,
+    );
+    const dispatched = gitWorkerStats().dispatched;
+    await new Promise((resolve) => setTimeout(resolve, 61_000));
+    expect(gitWorkerStats().dispatched).toBe(dispatched);
+  } finally {
+    process.env.PASEO_GIT_WORKER_COUNT = "0";
+  }
 }, 90_000);
 
 interface GitRuntimeExpectation {

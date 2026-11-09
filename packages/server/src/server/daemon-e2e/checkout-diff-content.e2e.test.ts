@@ -4,8 +4,20 @@ import { rm, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { expect, test } from "vitest";
+import { afterAll, expect, test } from "vitest";
 import { createDaemonTestContext } from "../test-utils/index.js";
+
+// This suite asserts the main-thread Git command ledger, so it reads in-thread.
+const originalGitWorkerCount = process.env.PASEO_GIT_WORKER_COUNT;
+process.env.PASEO_GIT_WORKER_COUNT = "0";
+
+afterAll(() => {
+  if (originalGitWorkerCount === undefined) {
+    delete process.env.PASEO_GIT_WORKER_COUNT;
+  } else {
+    process.env.PASEO_GIT_WORKER_COUNT = originalGitWorkerCount;
+  }
+});
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
