@@ -1,4 +1,5 @@
 import { appendFile } from "node:fs/promises";
+import { threadId } from "node:worker_threads";
 
 interface GitCommandTraceContext {
   id: string;
@@ -52,7 +53,9 @@ export function submitGitCommandTrace(
 
   const submittedAtMs = Date.now();
   const context: GitCommandTraceContext = {
-    id: `${process.pid}:${nextTraceId++}`,
+    // The counter is per module instance, so the thread id keeps ids unique
+    // between the main thread and the worker pool.
+    id: `${process.pid}:${threadId}:${nextTraceId++}`,
     args: [...args],
     cwd,
     submittedAtMs,
