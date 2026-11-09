@@ -531,6 +531,23 @@ describe("git worker pool", () => {
     }
   });
 
+  it("runs the read in-thread when the worker entry cannot be resolved", async () => {
+    const pool = new GitWorkerPool({
+      size: 1,
+      resolveEntry: () => {
+        throw new Error("tsx/esm/api is not resolvable");
+      },
+    });
+    try {
+      await expect(
+        pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
+      expect(pool.getStats()).toMatchObject({ fallbacks: 1, dispatched: 0, workers: 0 });
+    } finally {
+      await pool.dispose();
+    }
+  });
+
   it("does not resolve the worker entry until a worker spawns", async () => {
     const resolveEntry = vi.fn(() => createFakeWorker());
     const disabled = new GitWorkerPool({ size: 0, resolveEntry });
