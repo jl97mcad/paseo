@@ -418,7 +418,7 @@ type WorkspaceGitRefreshState =
       queued: WorkspaceGitRefreshRequest | null;
     };
 
-interface WorkspaceGitServiceDependencies {
+export interface WorkspaceGitServiceDependencies {
   subscribe: SubscribeToFileChanges;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
   getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
@@ -453,6 +453,8 @@ interface WorkspaceGitServiceDependencies {
   createWatcherLivenessCanary: typeof createWatcherLivenessCanary;
   workspaceFolderExists: (cwd: string) => Promise<boolean>;
   now: () => Date;
+  /** Owner of process-level resources some dependencies bring, such as workers. */
+  disposeDeps?: () => Promise<void>;
 }
 
 interface WorkspaceGitServiceOptions {
@@ -692,6 +694,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
     rejectOnClear: true,
   });
+  private readonly pendingRefreshes = new Set<Promise<WorkspaceGitRuntimeSnapshot>>();
   private readonly disposeController = new AbortController();
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
@@ -1203,10 +1206,16 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchAliases.clear();
     this.snapshotUpdatedListeners.clear();
     // Unsubscribing can remove a target while its Git command still owns the cwd.
-    // Stop admission first, then drain those refreshes and the parent lookups they start.
+    // Stop admission first, then drain those refreshes and the parent lookups they start,
+    // before releasing the dependencies' process-level resources (Git worker threads).
     this.disposePromise = (async () => {
       await Promise.all([this.fileObserver.close(), Promise.allSettled(this.pendingRefreshes)]);
       await Promise.allSettled(this.pendingForgeWebLookups);
+      try {
+        await this.deps.disposeDeps?.();
+      } catch (error) {
+        this.logger.warn({ err: error }, "Failed to dispose workspace Git dependencies");
+      }
     })();
     return this.disposePromise;
   }
