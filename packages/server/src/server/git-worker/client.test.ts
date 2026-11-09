@@ -3,7 +3,6 @@ import { mainGitProcessPolicy, splitGitProcessPolicy } from "../../utils/git-pro
 import { runWithGitCommandPriority } from "../../utils/run-git-command.js";
 import {
   GitWorkerPool,
-  GitWorkerQueueFullError,
   resolveGitWorkerCount,
   resolveGitWorkerEntry,
   type GitWorkerEntry,
@@ -246,7 +245,12 @@ describe("git worker pool", () => {
     const served: string[] = [];
     const record = (promise: Promise<unknown>) =>
       promise.then(
-        (value) => served.push((value as { op: string }).op),
+        (value) => {
+          // The held request finishes in-thread, so only worker replies carry an op.
+          const op = (value as { op?: string }).op;
+          if (op) served.push(op);
+          return undefined;
+        },
         () => undefined,
       );
     try {
@@ -263,7 +267,7 @@ describe("git worker pool", () => {
     }
   });
 
-  it("cancels the held request in the worker before terminating the thread", async () => {
+  it("cancels a timed-out request in the worker before terminating the thread", async () => {
     const cancelFlags = new Int32Array(new SharedArrayBuffer(4));
     const pool = createPool({
       entry: createFakeWorker({ holdAttempts: [0], cancelFlags }),
@@ -271,11 +275,9 @@ describe("git worker pool", () => {
       requestTimeoutMs: 100,
     });
     try {
-      await expect(readSnapshot(pool)).rejects.toMatchObject({
-        name: "GitWorkerRequestTimeoutError",
-      });
+      await expect(readSnapshot(pool)).resolves.toEqual({ cwd: "", fallback: true });
       await vi.waitFor(() => expect(cancelFlags[0]).toBe(1));
-      expect(pool.getStats()).toMatchObject({ retirements: 1 });
+      expect(pool.getStats()).toMatchObject({ retirements: 1, fallbacks: 1 });
     } finally {
       await pool.dispose();
     }
@@ -289,11 +291,9 @@ describe("git worker pool", () => {
       cancelGraceMs: 20,
     });
     try {
-      await expect(readSnapshot(pool)).rejects.toMatchObject({
-        name: "GitWorkerRequestTimeoutError",
-      });
+      await expect(readSnapshot(pool)).resolves.toEqual({ cwd: "", fallback: true });
       await expect(readStatus(pool)).resolves.toEqual({ cwd: "/tmp/workspace", attempt: 1 });
-      expect(pool.getStats()).toMatchObject({ retirements: 1, workers: 1 });
+      expect(pool.getStats()).toMatchObject({ retirements: 1, workers: 1, fallbacks: 1 });
     } finally {
       await pool.dispose();
     }
@@ -328,19 +328,17 @@ describe("git worker pool", () => {
     }
   });
 
-  it("retires a silent worker on timeout and serves the next request from a fresh one", async () => {
+  it("runs a slow read in-thread when the worker exceeds the request budget", async () => {
     const pool = createPool({
       entry: createFakeWorker({ holdAttempts: [0] }),
       workerData: createAttempts(),
       requestTimeoutMs: 100,
     });
     try {
-      const error = await pool
-        .run({ op: "snapshotFacts", input }, () => fallbackValue(""))
-        .catch((cause: unknown) => cause);
-      expect(error).toMatchObject({ name: "GitWorkerRequestTimeoutError" });
-      expect((error as Error).message).toContain("snapshotFacts timed out after 100ms");
-      expect(pool.getStats()).toMatchObject({ dispatched: 1, retirements: 1, workers: 0 });
+      await expect(
+        pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
+      expect(pool.getStats()).toMatchObject({ dispatched: 1, retirements: 1, fallbacks: 1 });
 
       await expect(
         pool.run({ op: "checkoutStatus", input }, () => fallbackValue("")),
@@ -349,48 +347,47 @@ describe("git worker pool", () => {
         dispatched: 2,
         retirements: 1,
         workers: 1,
-        fallbacks: 0,
+        fallbacks: 1,
       });
     } finally {
       await pool.dispose();
     }
   });
 
-  it("rejects the in-flight request when the worker exits, then respawns", async () => {
+  it("runs the in-flight read in-thread when the worker exits, then respawns", async () => {
     const pool = createPool({
       entry: createFakeWorker({ exitAttempts: [0] }),
       workerData: createAttempts(),
     });
     try {
       await expect(
-        pool.run({ op: "shortstat", input: { ...input, force: true } }, () => fallbackValue("")),
-      ).rejects.toThrow(/Git worker exited/);
+        pool.run({ op: "shortstat", input: { ...input, force: true } }, () =>
+          fallbackValue(input.cwd),
+        ),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
       await expect(
         pool.run({ op: "worktreeState", input }, () => fallbackValue("")),
       ).resolves.toEqual({ cwd: "/tmp/workspace", attempt: 1 });
-      expect(pool.getStats()).toMatchObject({ dispatched: 2, retirements: 1, fallbacks: 0 });
+      expect(pool.getStats()).toMatchObject({ dispatched: 2, retirements: 1, fallbacks: 1 });
     } finally {
       await pool.dispose();
     }
   });
 
   it("falls back in-thread once workers fail repeatedly, logging once", async () => {
-    const logger = { warn: vi.fn() };
+    const logger = { warn: vi.fn(), error: vi.fn() };
     const pool = createPool({
       entry: createFakeWorker({ exitAttempts: [0, 1, 2, 3] }),
       workerData: createAttempts(),
       logger,
     });
     try {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
+      for (let attempt = 0; attempt < 4; attempt += 1) {
         await expect(
           pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
-        ).rejects.toThrow(/Git worker exited/);
+        ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
       }
-      await expect(
-        pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
-      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
-      expect(pool.getStats()).toMatchObject({ enabled: false, fallbacks: 1 });
+      expect(pool.getStats()).toMatchObject({ enabled: false, fallbacks: 4 });
 
       const messages = logger.warn.mock.calls.map((call) => String(call[1]));
       expect(messages.filter((message) => message.includes("failed repeatedly"))).toHaveLength(1);
@@ -399,8 +396,35 @@ describe("git worker pool", () => {
     }
   });
 
+  it("tries worker threads again after the cooldown following rapid failures", async () => {
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    const pool = createPool({
+      entry: createFakeWorker({ exitAttempts: [0, 1, 2] }),
+      workerData: createAttempts(),
+      logger,
+      recoveryCooldownMs: 20,
+    });
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(
+          pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
+        ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
+      }
+      expect(pool.getStats()).toMatchObject({ enabled: false });
+
+      await new Promise((resolve) => setTimeout(resolve, 25));
+
+      await expect(
+        pool.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", attempt: 3 });
+      expect(pool.getStats()).toMatchObject({ enabled: true, workers: 1 });
+    } finally {
+      await pool.dispose();
+    }
+  });
+
   it("runs work that is still queued when the pool gives up in-thread", async () => {
-    const logger = { warn: vi.fn() };
+    const logger = { warn: vi.fn(), error: vi.fn() };
     const pool = createPool({
       entry: createFakeWorker({ exitAttempts: [0, 1, 2, 3] }),
       workerData: createAttempts(),
@@ -415,23 +439,26 @@ describe("git worker pool", () => {
         ),
         pool.run({ op: "worktreeState", input }, () => fallbackValue(input.cwd)),
       ]);
-      expect(results.slice(0, 3).map((result) => result.status)).toEqual([
-        "rejected",
-        "rejected",
-        "rejected",
+      expect(results.map((result) => result.status)).toEqual([
+        "fulfilled",
+        "fulfilled",
+        "fulfilled",
+        "fulfilled",
       ]);
-      expect(results[3]).toEqual({
-        status: "fulfilled",
-        value: { cwd: "/tmp/workspace", fallback: true },
-      });
-      expect(pool.getStats()).toMatchObject({ enabled: false, fallbacks: 1 });
+      for (const result of results) {
+        expect(result).toEqual({
+          status: "fulfilled",
+          value: { cwd: "/tmp/workspace", fallback: true },
+        });
+      }
+      expect(pool.getStats()).toMatchObject({ enabled: false, fallbacks: 4 });
     } finally {
       await pool.dispose();
     }
   });
 
-  it("rejects work when the queue is full, logging the saturation once", async () => {
-    const logger = { warn: vi.fn() };
+  it("runs a saturated queue's reads in-thread, logging the saturation once", async () => {
+    const logger = { warn: vi.fn(), error: vi.fn() };
     const pool = createPool({
       entry: createFakeWorker({ holdAttempts: [0] }),
       queueLimit: 1,
@@ -445,9 +472,11 @@ describe("git worker pool", () => {
         .run({ op: "checkoutStatus", input }, () => fallbackValue(""))
         .catch(() => undefined);
       await expect(
-        pool.run({ op: "shortstat", input: { ...input, force: true } }, () => fallbackValue("")),
-      ).rejects.toBeInstanceOf(GitWorkerQueueFullError);
-      expect(pool.getStats()).toMatchObject({ queued: 1, dropped: 1 });
+        pool.run({ op: "shortstat", input: { ...input, force: true } }, () =>
+          fallbackValue(input.cwd),
+        ),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
+      expect(pool.getStats()).toMatchObject({ queued: 1, dropped: 1, fallbacks: 1 });
       const messages = logger.warn.mock.calls.map((call) => String(call[1]));
       expect(messages.filter((message) => message.includes("queue is full"))).toHaveLength(1);
       await pool.dispose();
