@@ -235,7 +235,7 @@ export type {
 } from "./agent-timeline-store-types.js";
 
 export type AgentManagerEvent =
-  | { type: "agent_state"; agent: ManagedAgent }
+  | { type: "agent_state"; agent: ManagedAgent; lastStatus?: StoredAgentRecord["lastStatus"] }
   | { type: "agent_removed"; agentId: string; workspaceId?: string; internal: boolean }
   | { type: "provider_subagent"; event: ProviderSubagentStoreEvent }
   | { type: "timeline_replacement"; agentId: string; epoch: string }
@@ -1973,7 +1973,9 @@ export class AgentManager {
       persistError = error;
     }
     this.detachPluginTools(agentId);
-    this.emitClosedAgent(closedAgent, { persist: false });
+    // A reaped failure keeps reporting as a failure to subscribed clients too, not only in the
+    // stored record: the close is a release of the process, not a change of outcome.
+    this.emitClosedAgent(closedAgent, { persist: false, lastStatus });
     this.logger.trace(
       {
         agentId,
@@ -4129,7 +4131,10 @@ export class AgentManager {
     }
   }
 
-  private emitClosedAgent(agent: ManagedAgentClosed, options?: { persist?: boolean }): void {
+  private emitClosedAgent(
+    agent: ManagedAgentClosed,
+    options?: { persist?: boolean; lastStatus?: StoredAgentRecord["lastStatus"] },
+  ): void {
     this.emitState(agent, options);
     if (!agent.internal) {
       this.pluginLifecycle?.emit("agent.close.after", {
@@ -5216,7 +5221,10 @@ export class AgentManager {
     return row;
   }
 
-  private emitState(agent: ManagedAgent, options?: { persist?: boolean }): void {
+  private emitState(
+    agent: ManagedAgent,
+    options?: { persist?: boolean; lastStatus?: StoredAgentRecord["lastStatus"] },
+  ): void {
     // Keep attention as an edge-triggered unread signal, not a level signal.
     this.checkAndSetAttention(agent);
     if (options?.persist !== false) {
@@ -5242,6 +5250,7 @@ export class AgentManager {
     this.dispatch({
       type: "agent_state",
       agent: { ...agent },
+      lastStatus: options?.lastStatus,
     });
   }
 
