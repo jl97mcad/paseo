@@ -80,9 +80,12 @@ export const WORKSPACE_GIT_TARGET_IDLE_TTL_MS = 5 * 60_000;
 const BACKGROUND_GIT_FETCH_INTERVAL_MS = 180_000;
 const FETCH_METADATA_ECHO_TTL_MS = 5_000;
 export const WORKSPACE_GIT_OBSERVATION_REENSURE_INTERVAL_MS = 60_000;
-const FORGE_PR_STATUS_POLL_FAST_INTERVAL_MS = 20_000;
-const FORGE_PR_STATUS_POLL_SLOW_INTERVAL_MS = 120_000;
-const FORGE_PR_STATUS_POLL_ERROR_BACKOFF_CAP_MS = 300_000;
+// A forge PR read is one HTTP round trip per workspace. Installed hosts run many workspaces at
+// once, so poll pending checks every minute and everything else every ten. The backoff cap is
+// three times the slow base: a target that keeps failing must never poll faster than a healthy one.
+const FORGE_PR_STATUS_POLL_FAST_INTERVAL_MS = 60_000;
+const FORGE_PR_STATUS_POLL_SLOW_INTERVAL_MS = 600_000;
+const FORGE_PR_STATUS_POLL_ERROR_BACKOFF_CAP_MS = 1_800_000;
 const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
 // Degraded polling shells out a full Git refresh per tick, and the repositories that defeat the
 // recursive watcher are the ones where that refresh is expensive. At a fixed cadence the daemon

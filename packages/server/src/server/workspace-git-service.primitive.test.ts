@@ -1281,7 +1281,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, listener);
       await flushPromises();
 
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(600_000);
       await flushPromises();
 
       expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledWith({
@@ -1345,7 +1345,7 @@ describe("WorkspaceGitServiceImpl primitive refresh entrypoint", () => {
     try {
       const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
       await flushPromises();
-      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(60_000);
       await flushPromises();
 
       expect(forge.getCurrentPullRequestStatus).toHaveBeenCalledTimes(1);
