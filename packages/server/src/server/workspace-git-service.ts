@@ -369,7 +369,7 @@ type WorkspaceGitRefreshState =
       queued: WorkspaceGitRefreshRequest | null;
     };
 
-interface WorkspaceGitServiceDependencies {
+export interface WorkspaceGitServiceDependencies {
   subscribe: SubscribeToFileChanges;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
   getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
@@ -400,6 +400,8 @@ interface WorkspaceGitServiceDependencies {
   createWatcherLivenessCanary: typeof createWatcherLivenessCanary;
   workspaceFolderExists: (cwd: string) => Promise<boolean>;
   now: () => Date;
+  /** Owner of process-level resources some dependencies bring, such as workers. */
+  disposeDeps?: () => Promise<void>;
 }
 
 interface WorkspaceGitServiceOptions {
@@ -1128,7 +1130,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.disposePromise = Promise.all([
       this.fileObserver.close(),
       Promise.allSettled(this.pendingRefreshes),
-    ]).then(() => undefined);
+    ]).then(async () => {
+      try {
+        await this.deps.disposeDeps?.();
+      } catch (error) {
+        this.logger.warn({ err: error }, "Failed to dispose workspace Git dependencies");
+      }
+      return undefined;
+    });
     return this.disposePromise;
   }
 
