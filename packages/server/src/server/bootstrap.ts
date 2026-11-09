@@ -172,6 +172,7 @@ import { resolvePaseoToolPolicy } from "./agent/paseo-tool-policy.js";
 import { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { DaemonConfigBrowserToolsPolicy } from "./browser-tools/policy.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
+import { createWorkerGitDeps, resolveGitWorkerCount } from "./git-worker/client.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   archiveByScope,
@@ -951,14 +952,30 @@ export async function createPaseoDaemon(
     workspaceRegistry,
   });
   const github = createGitHubService();
+  const gitWorkerCount = resolveGitWorkerCount(process.env);
   const workspaceGitService = new WorkspaceGitServiceImpl({
     logger,
     paseoHome: config.paseoHome,
     worktreesRoot: config.worktreesRoot,
     deps: {
       forgeOverrides: { github },
+      // Per-workspace checkout reads run off the main thread; PASEO_GIT_WORKER_COUNT=0
+      // leaves them in-thread. The pool divides the live Git process policy between
+      // its threads and falls back in-thread if it cannot hold work.
+      ...createWorkerGitDeps({
+        logger,
+        size: gitWorkerCount,
+        getGitProcessPolicy: () =>
+          daemonConfigStore.get().git ?? resolveGitProcessPolicy({ env: process.env }),
+      }),
     },
   });
+  logger.info(
+    { gitWorkerCount },
+    gitWorkerCount > 0
+      ? "Reading workspace Git in worker threads"
+      : "Reading workspace Git on the main thread",
+  );
   const workspaceRuntimeStore = createWorkspaceRuntimeStore();
   workspaceGitService.onSnapshotUpdated((snapshot) => workspaceRuntimeStore.set(snapshot));
   workspaceRegistry.subscribeToMutations(async (mutation) => {
