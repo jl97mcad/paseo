@@ -432,8 +432,8 @@ function executeGitCommand<Output>(
         return;
       }
 
-      // Registered only once the child exists: the executor above already
-      // refused an aborted signal, and nothing awaits between the two.
+      // Registered only once the child exists: nothing awaits between the
+      // spawn above and this line, so an abort cannot slip through the gap.
       const onAbort = () => {
         abortError = abortSignalError(options.signal, command);
         const error = abortError;
@@ -444,6 +444,11 @@ function executeGitCommand<Output>(
       };
       options.signal?.addEventListener("abort", onAbort, { once: true });
       removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
+      if (options.signal?.aborted) {
+        // The signal fired while this command queued for a slot, before there
+        // was a listener to hear it: kill what the admission just started.
+        onAbort();
+      }
 
       const stdout = child.stdout;
       const stderr = child.stderr;
