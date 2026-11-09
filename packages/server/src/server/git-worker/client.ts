@@ -324,8 +324,15 @@ export class GitWorkerPool {
   }
 
   private spawnSlot(): WorkerSlot | null {
-    // Resolved on the first spawn, so a disabled pool never loads the entry.
-    const entry = (this.entry ??= this.resolveEntry());
+    let entry: GitWorkerEntry;
+    try {
+      // Resolved on the first spawn, so a disabled pool never loads the entry.
+      entry = this.entry ??= this.resolveEntry();
+    } catch (error) {
+      // A pool with no usable entry serves its queued reads in-thread.
+      this.noteFailure(error);
+      return null;
+    }
     let worker: Worker;
     try {
       worker = new Worker(entry.script, {
