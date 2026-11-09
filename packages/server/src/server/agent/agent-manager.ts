@@ -171,6 +171,11 @@ async function assertUsableWorkingDirectory(cwd: string): Promise<void> {
   }
 }
 
+interface CloseAgentRuntimeOptions {
+  canClose?: () => boolean;
+  keepErrorStatus?: boolean;
+}
+
 interface PreparedSessionConfig {
   storedConfig: AgentSessionConfig;
   launchConfig: AgentSessionConfig;
@@ -1941,7 +1946,7 @@ export class AgentManager {
 
   private async closeAgentRuntime(
     agentId: string,
-    options?: { canClose?: () => boolean; keepErrorStatus?: boolean },
+    options?: CloseAgentRuntimeOptions,
   ): Promise<boolean> {
     const agent = this.requireAgent(agentId);
     this.logger.trace(
