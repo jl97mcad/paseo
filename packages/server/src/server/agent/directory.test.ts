@@ -114,6 +114,20 @@ test("prompt recency ignores background agents", async () => {
   );
 });
 
+test("default lists hide archived records and includeArchived returns them", async () => {
+  const base = { provider: "codex", cwd: home, createdAt: NOW, updatedAt: NOW };
+  await storage.upsert({ ...base, id: "visible", workspaceId: "open" });
+  await storage.upsert({ ...base, id: "archived-open", workspaceId: "open", archivedAt: NOW });
+  await storage.upsert({ ...base, id: "archived-hidden", workspaceId: "hidden", archivedAt: NOW });
+
+  expect(await listedIds(false)).toEqual(["visible"]);
+  const active = (await directory.list({ includeBackground: true })).map((agent) => agent.id);
+  const withArchived = (
+    await directory.list({ includeArchived: true, includeBackground: true })
+  ).map((agent) => agent.id);
+  expect(withArchived.sort()).toEqual([...active, "archived-hidden", "archived-open"].sort());
+});
+
 test("scoped status queries retain cross-workspace parent context", async () => {
   const base = { provider: "codex", cwd: home, createdAt: NOW, updatedAt: NOW };
   await storage.upsert({ ...base, id: "parent", workspaceId: "open" });

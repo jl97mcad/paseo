@@ -131,6 +131,7 @@ export class AgentStorage {
   private daemonAgentIdsByExecution: Map<string, string> = new Map();
   private daemonExecutionKeysByAgentId: Map<string, string> = new Map();
   private readonly idsByWorkspace = new Map<string, Set<string>>();
+  private readonly activeIdsByWorkspace = new Map<string, Set<string>>();
   private readonly workspaceById = new Map<string, string>();
   private readonly activeIds = new Set<string>();
   private readonly promptTimeByAgent = new Map<string, string>();
@@ -167,11 +168,13 @@ export class AgentStorage {
     options?: { includeArchived?: boolean },
   ): Promise<StoredAgentRecord[]> {
     await this.load();
+    // Default reads walk the active index only; archived history stays behind
+    // the explicit includeArchived flag.
+    const index = options?.includeArchived ? this.idsByWorkspace : this.activeIdsByWorkspace;
     const records: StoredAgentRecord[] = [];
     for (const workspaceId of new Set(workspaceIds)) {
-      for (const id of this.idsByWorkspace.get(workspaceId) ?? []) {
-        const record = this.cache.get(id)!;
-        if (options?.includeArchived || !record.archivedAt) records.push(record);
+      for (const id of index.get(workspaceId) ?? []) {
+        records.push(this.cache.get(id)!);
       }
     }
     return records;
@@ -209,7 +212,10 @@ export class AgentStorage {
 
   private indexWorkspace(record: StoredAgentRecord): void {
     const previous = this.workspaceById.get(record.id);
-    if (previous) this.idsByWorkspace.get(previous)?.delete(record.id);
+    if (previous) {
+      this.idsByWorkspace.get(previous)?.delete(record.id);
+      this.activeIdsByWorkspace.get(previous)?.delete(record.id);
+    }
     this.workspaceById.delete(record.id);
     this.activeIds.delete(record.id);
     if (!record.archivedAt) this.activeIds.add(record.id);
@@ -217,6 +223,11 @@ export class AgentStorage {
       const ids = this.idsByWorkspace.get(record.workspaceId) ?? new Set<string>();
       ids.add(record.id);
       this.idsByWorkspace.set(record.workspaceId, ids);
+      if (!record.archivedAt) {
+        const activeIds = this.activeIdsByWorkspace.get(record.workspaceId) ?? new Set<string>();
+        activeIds.add(record.id);
+        this.activeIdsByWorkspace.set(record.workspaceId, activeIds);
+      }
       this.workspaceById.set(record.id, record.workspaceId);
     }
     this.indexPromptTime(record, previous);
@@ -377,6 +388,7 @@ export class AgentStorage {
     this.activeIds.delete(agentId);
     if (workspaceId) {
       this.idsByWorkspace.get(workspaceId)?.delete(agentId);
+      this.activeIdsByWorkspace.get(workspaceId)?.delete(agentId);
       this.refreshPromptTime(workspaceId);
     }
     this.cache.delete(agentId);
