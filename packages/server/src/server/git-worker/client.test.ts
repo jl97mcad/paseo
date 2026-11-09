@@ -1,12 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import type { GitProcessPolicy } from "../../utils/git-process-scheduler.js";
+import { mainGitProcessPolicy, splitGitProcessPolicy } from "../../utils/git-process-scheduler.js";
 import { runWithGitCommandPriority } from "../../utils/run-git-command.js";
 import {
   GitWorkerPool,
   GitWorkerQueueFullError,
   resolveGitWorkerCount,
   resolveGitWorkerEntry,
-  shareGitProcessPolicy,
   type GitWorkerEntry,
   type GitWorkerPoolOptions,
 } from "./client.js";
@@ -29,6 +28,8 @@ interface FakeWorkerBehaviour {
   cancelFlags?: Int32Array;
   /** Receive the cancel but never confirm it. */
   ignoreCancel?: boolean;
+  /** Record the `[concurrency, rate]` of every policy message it receives. */
+  policyRecords?: Int32Array;
 }
 
 function createFakeWorker(behaviour: FakeWorkerBehaviour = {}): GitWorkerEntry {
@@ -42,6 +43,7 @@ const exitAttempts = ${JSON.stringify(behaviour.exitAttempts ?? [])};
 const failWith = ${JSON.stringify(behaviour.failWith ?? null)};
 const ignoreCancel = ${behaviour.ignoreCancel === true};
 const cancelFlags = (workerData && workerData.cancelFlags) || null;
+const policyRecords = (workerData && workerData.policyRecords) || null;
 const attempt = (workerData && workerData.attempt) || 0;
 parentPort.on("message", (request) => {
   if (request && request.type === "cancel") {
@@ -50,6 +52,13 @@ parentPort.on("message", (request) => {
     }
     if (!ignoreCancel) {
       parentPort.postMessage({ type: "cancelled", id: request.id });
+    }
+    return;
+  }
+  if (request && request.type === "policy") {
+    if (policyRecords) {
+      policyRecords[0] = request.policy.maxProcessConcurrency;
+      policyRecords[1] = request.policy.maxProcessesPerSecond;
     }
     return;
   }
@@ -135,19 +144,42 @@ describe("git worker entry resolution", () => {
     expect(resolveGitWorkerCount({ PASEO_GIT_WORKER_COUNT: "many" })).toBe(2);
   });
 
-  it("divides the daemon Git process policy between the pool's threads", () => {
-    const policy: GitProcessPolicy = { maxProcessConcurrency: 8, maxProcessesPerSecond: 64 };
-    expect(shareGitProcessPolicy(policy, 2)).toEqual({
+  it("gives main the larger half of the cap and the workers the other half", () => {
+    const full = { maxProcessConcurrency: 8, maxProcessesPerSecond: 64 };
+    expect(splitGitProcessPolicy(full, 1)).toEqual({
+      main: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
+      worker: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
+    });
+    expect(splitGitProcessPolicy(full, 2)).toEqual({
+      main: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
+      worker: { maxProcessConcurrency: 2, maxProcessesPerSecond: 16 },
+    });
+    expect(splitGitProcessPolicy(full, 4)).toEqual({
+      main: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
+      worker: { maxProcessConcurrency: 1, maxProcessesPerSecond: 8 },
+    });
+    // Small caps keep one process and one start per second on each side.
+    expect(
+      splitGitProcessPolicy({ maxProcessConcurrency: 2, maxProcessesPerSecond: 2 }, 2),
+    ).toEqual({
+      main: { maxProcessConcurrency: 1, maxProcessesPerSecond: 1 },
+      worker: { maxProcessConcurrency: 1, maxProcessesPerSecond: 1 },
+    });
+    expect(
+      splitGitProcessPolicy({ maxProcessConcurrency: 1, maxProcessesPerSecond: 1 }, 1),
+    ).toEqual({
+      main: { maxProcessConcurrency: 1, maxProcessesPerSecond: 1 },
+      worker: { maxProcessConcurrency: 1, maxProcessesPerSecond: 1 },
+    });
+  });
+
+  it("keeps the whole cap on main while the pool is off", () => {
+    const full = { maxProcessConcurrency: 8, maxProcessesPerSecond: 64 };
+    expect(mainGitProcessPolicy(full, 0)).toEqual(full);
+    expect(mainGitProcessPolicy(full, 2)).toEqual({
       maxProcessConcurrency: 4,
       maxProcessesPerSecond: 32,
     });
-    expect(shareGitProcessPolicy(policy, 4)).toEqual({
-      maxProcessConcurrency: 2,
-      maxProcessesPerSecond: 16,
-    });
-    expect(
-      shareGitProcessPolicy({ maxProcessConcurrency: 1, maxProcessesPerSecond: 1 }, 4),
-    ).toEqual({ maxProcessConcurrency: 1, maxProcessesPerSecond: 1 });
   });
 });
 
@@ -177,16 +209,16 @@ describe("git worker pool", () => {
       size: 2,
       entry: createFakeWorker({ replyWithWorkerData: true }),
       workerData: () => ({
-        gitProcessPolicy: shareGitProcessPolicy(
+        gitProcessPolicy: splitGitProcessPolicy(
           { maxProcessConcurrency: 8, maxProcessesPerSecond: 64 },
           2,
-        ),
+        ).worker,
       }),
     });
     try {
       const data = await pool.run({ op: "snapshotFacts", input }, () => fallbackValue(""));
       expect(data).toEqual({
-        gitProcessPolicy: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
+        gitProcessPolicy: { maxProcessConcurrency: 2, maxProcessesPerSecond: 16 },
       });
     } finally {
       await pool.dispose();
@@ -420,6 +452,21 @@ describe("git worker pool", () => {
       expect(messages.filter((message) => message.includes("queue is full"))).toHaveLength(1);
       await pool.dispose();
       await Promise.all([inFlight, queued]);
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("posts a live policy change to the workers that are already running", async () => {
+    const policyRecords = new Int32Array(new SharedArrayBuffer(8));
+    const pool = createPool({
+      entry: createFakeWorker({ policyRecords }),
+      workerData: () => ({ policyRecords }),
+    });
+    try {
+      await readSnapshot(pool);
+      pool.updateGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
+      await vi.waitFor(() => expect(Array.from(policyRecords)).toEqual([4, 32]));
     } finally {
       await pool.dispose();
     }

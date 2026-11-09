@@ -9,6 +9,7 @@ import {
 } from "../../utils/checkout-git.js";
 import {
   resolveGitProcessPolicy,
+  splitGitProcessPolicy,
   type GitProcessPolicy,
 } from "../../utils/git-process-scheduler.js";
 import {
@@ -19,6 +20,7 @@ import {
 } from "../../utils/run-git-command.js";
 import {
   isGitWorkerCancel,
+  isGitWorkerPolicy,
   toGitWorkerErrorPayload,
   type GitWorkerMessage,
   type GitWorkerReply,
@@ -27,6 +29,7 @@ import {
   type GitWorkerTask,
 } from "./protocol.js";
 
+const DEFAULT_WORKER_POOL_SIZE = 2;
 const runGitCommand = createRunGitCommand("workspace-refresh:worker");
 
 export interface GitWorkerTaskHandlerOptions {
@@ -86,21 +89,17 @@ export function createGitWorkerTaskHandler(options: GitWorkerTaskHandlerOptions)
 
 const port = parentPort;
 if (port) {
-  // This thread is one of a small pool, so it gets a share of the daemon's Git
-  // process cap rather than a second full cap. The pool passes the share it
-  // computed from the live policy; the fallback divides the environment policy by
-  // the default pool size.
-  const sharedPolicy = (workerData as { gitProcessPolicy?: GitProcessPolicy } | null)
-    ?.gitProcessPolicy;
-  if (sharedPolicy) {
-    configureGitProcessPolicy(sharedPolicy);
-  } else {
-    const policy = resolveGitProcessPolicy({ env: process.env });
-    configureGitProcessPolicy({
-      maxProcessConcurrency: Math.max(1, Math.floor(policy.maxProcessConcurrency / 2)),
-      maxProcessesPerSecond: Math.max(1, Math.floor(policy.maxProcessesPerSecond / 2)),
-    });
-  }
+  // The pool gives every thread a share of the daemon's Git process cap and
+  // keeps the other half on main; the threads never get a second full cap. The
+  // pool passes the share computed from the live policy and re-sends it when
+  // that policy changes. A worker started outside a pool divides the
+  // environment policy for the default pool size instead.
+  const data = workerData as { gitProcessPolicy?: GitProcessPolicy } | null;
+  configureGitProcessPolicy(
+    data?.gitProcessPolicy ??
+      splitGitProcessPolicy(resolveGitProcessPolicy({ env: process.env }), DEFAULT_WORKER_POOL_SIZE)
+        .worker,
+  );
 
   const handler = createGitWorkerTaskHandler({ post: (message) => port.postMessage(message) });
   // The client admits one request per worker, so the port queues the first
@@ -108,6 +107,10 @@ if (port) {
   port.on("message", (message: GitWorkerMessage) => {
     if (isGitWorkerCancel(message)) {
       handler.cancel(message.id);
+      return;
+    }
+    if (isGitWorkerPolicy(message)) {
+      configureGitProcessPolicy(message.policy);
       return;
     }
     void handler.run(message);

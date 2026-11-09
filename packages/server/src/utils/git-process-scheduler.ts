@@ -44,6 +44,35 @@ export function resolveGitProcessPolicy(input: {
   };
 }
 
+/**
+ * Split one daemon Git process policy between the main thread and the pool.
+ * Main keeps the larger half; the pool divides the smaller half across its
+ * threads, with one process each at minimum. Both limits are split, so the
+ * pool adds no capacity beyond the configured cap unless the cap is smaller
+ * than the number of threads.
+ */
+export function splitGitProcessPolicy(
+  policy: GitProcessPolicy,
+  poolSize: number,
+): { main: GitProcessPolicy; worker: GitProcessPolicy } {
+  const share = Math.max(1, poolSize);
+  return {
+    main: {
+      maxProcessConcurrency: Math.max(1, Math.ceil(policy.maxProcessConcurrency / 2)),
+      maxProcessesPerSecond: Math.max(1, Math.ceil(policy.maxProcessesPerSecond / 2)),
+    },
+    worker: {
+      maxProcessConcurrency: Math.max(1, Math.floor(policy.maxProcessConcurrency / 2 / share)),
+      maxProcessesPerSecond: Math.max(1, Math.floor(policy.maxProcessesPerSecond / 2 / share)),
+    },
+  };
+}
+
+/** The configured cap stays whole while Git reads in-thread. */
+export function mainGitProcessPolicy(policy: GitProcessPolicy, poolSize: number): GitProcessPolicy {
+  return poolSize > 0 ? splitGitProcessPolicy(policy, poolSize).main : policy;
+}
+
 export class GitProcessScheduler {
   private readonly startThrottled;
   private readonly highPriorityQueue: Array<() => void> = [];

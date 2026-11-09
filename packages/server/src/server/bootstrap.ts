@@ -231,7 +231,7 @@ import { WorkspaceAutoName } from "./workspace-auto-name.js";
 import { createGitMutationService } from "./session/git-mutation/git-mutation-service.js";
 import { workspaceIdsOnCheckout } from "./workspace-directory.js";
 import { configureGitProcessPolicy } from "../utils/run-git-command.js";
-import { resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
+import { mainGitProcessPolicy, resolveGitProcessPolicy } from "../utils/git-process-scheduler.js";
 import { resolveFirstAgentPromptTitle } from "./agent/create-agent-title.js";
 import {
   createAgentCommand,
@@ -625,7 +625,15 @@ export async function createPaseoDaemon(
   rootLogger: Logger,
   dependencies: PaseoDaemonDependencies = {},
 ): Promise<PaseoDaemon> {
-  configureGitProcessPolicy(config.git ?? resolveGitProcessPolicy({ env: process.env }));
+  const gitWorkerCount = resolveGitWorkerCount(process.env);
+  // The pool's threads share the configured cap with the main thread instead of
+  // adding a second one on top.
+  configureGitProcessPolicy(
+    mainGitProcessPolicy(
+      config.git ?? resolveGitProcessPolicy({ env: process.env }),
+      gitWorkerCount,
+    ),
+  );
   const logger = rootLogger.child({ module: "bootstrap" });
   const obsoleteTimelineDirectory = path.join(config.paseoHome, "agent-timelines");
   await rm(obsoleteTimelineDirectory, { recursive: true, force: true }).catch((error) => {
@@ -952,7 +960,12 @@ export async function createPaseoDaemon(
     workspaceRegistry,
   });
   const github = createGitHubService();
-  const gitWorkerCount = resolveGitWorkerCount(process.env);
+  const workerGitDeps = createWorkerGitDeps({
+    logger,
+    size: gitWorkerCount,
+    getGitProcessPolicy: () =>
+      daemonConfigStore.get().git ?? resolveGitProcessPolicy({ env: process.env }),
+  });
   const workspaceGitService = new WorkspaceGitServiceImpl({
     logger,
     paseoHome: config.paseoHome,
@@ -960,14 +973,9 @@ export async function createPaseoDaemon(
     deps: {
       forgeOverrides: { github },
       // Per-workspace checkout reads run off the main thread; PASEO_GIT_WORKER_COUNT=0
-      // leaves them in-thread. The pool divides the live Git process policy between
-      // its threads and falls back in-thread if it cannot hold work.
-      ...createWorkerGitDeps({
-        logger,
-        size: gitWorkerCount,
-        getGitProcessPolicy: () =>
-          daemonConfigStore.get().git ?? resolveGitProcessPolicy({ env: process.env }),
-      }),
+      // leaves them in-thread. The pool shares the live Git process policy with
+      // main and falls back in-thread if it cannot hold work.
+      ...workerGitDeps,
     },
   });
   logger.info(
@@ -1019,14 +1027,14 @@ export async function createPaseoDaemon(
   daemonConfigStore.onFieldChange("catalogRefreshTimeoutMs", (value) => {
     providerSnapshotManager.setRefreshTimeoutMs(typeof value === "number" ? value : undefined);
   });
-  daemonConfigStore.onFieldChange("git.maxProcessesPerSecond", () => {
+  const applyLiveGitPolicy = (): void => {
     const git = daemonConfigStore.get().git;
-    if (git) configureGitProcessPolicy(git);
-  });
-  daemonConfigStore.onFieldChange("git.maxProcessConcurrency", () => {
-    const git = daemonConfigStore.get().git;
-    if (git) configureGitProcessPolicy(git);
-  });
+    if (!git) return;
+    configureGitProcessPolicy(mainGitProcessPolicy(git, gitWorkerCount));
+    workerGitDeps.updateGitProcessPolicy(git);
+  };
+  daemonConfigStore.onFieldChange("git.maxProcessesPerSecond", applyLiveGitPolicy);
+  daemonConfigStore.onFieldChange("git.maxProcessConcurrency", applyLiveGitPolicy);
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,

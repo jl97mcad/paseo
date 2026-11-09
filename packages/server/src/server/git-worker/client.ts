@@ -12,6 +12,7 @@ import {
 } from "../../utils/checkout-git.js";
 import {
   resolveGitProcessPolicy,
+  splitGitProcessPolicy,
   type GitProcessPolicy,
   type GitProcessPriority,
 } from "../../utils/git-process-scheduler.js";
@@ -23,6 +24,7 @@ import {
   type GitWorkerCancel,
   type GitWorkerCheckoutInput,
   type GitWorkerOutputs,
+  type GitWorkerPolicy,
   type GitWorkerReply,
   type GitWorkerResponse,
   type GitWorkerTask,
@@ -100,18 +102,6 @@ export function resolveGitWorkerCount(env: NodeJS.ProcessEnv): number {
   }
   const parsed = Number(raw);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_GIT_WORKER_COUNT;
-}
-
-/** Split the daemon's Git process cap so the pool's threads share it. */
-export function shareGitProcessPolicy(
-  policy: GitProcessPolicy,
-  poolSize: number,
-): GitProcessPolicy {
-  const share = Math.max(1, poolSize);
-  return {
-    maxProcessConcurrency: Math.max(1, Math.floor(policy.maxProcessConcurrency / share)),
-    maxProcessesPerSecond: Math.max(1, Math.floor(policy.maxProcessesPerSecond / share)),
-  };
 }
 
 interface QueuedRequest {
@@ -467,6 +457,22 @@ export class GitWorkerPool {
     );
   }
 
+  /** A live policy change reaches the threads that are already running. */
+  updateGitProcessPolicy(policy: GitProcessPolicy): void {
+    if (this.size === 0) {
+      return;
+    }
+    const workerPolicy = splitGitProcessPolicy(policy, this.size).worker;
+    const message: GitWorkerPolicy = { type: "policy", policy: workerPolicy };
+    for (const slot of this.slots) {
+      try {
+        slot.worker.postMessage(message, []);
+      } catch {
+        // An exiting thread is replaced with the new share on its next spawn.
+      }
+    }
+  }
+
   private logDrain(): void {
     if (!this.saturationLogged) {
       return;
@@ -497,6 +503,8 @@ export type WorkerGitDeps = Pick<
 > & {
   disposeDeps: () => Promise<void>;
   workerStats: () => GitWorkerStats;
+  /** Re-derive the threads' policy share after a live Git policy change. */
+  updateGitProcessPolicy: (policy: GitProcessPolicy) => void;
 };
 
 export function createWorkerGitDeps(options: WorkerGitDepsOptions = {}): WorkerGitDeps {
@@ -511,7 +519,7 @@ export function createWorkerGitDeps(options: WorkerGitDepsOptions = {}): WorkerG
     queueLimit: options.queueLimit,
     workerData:
       size > 0
-        ? () => ({ gitProcessPolicy: shareGitProcessPolicy(resolvePolicy(), size) })
+        ? () => ({ gitProcessPolicy: splitGitProcessPolicy(resolvePolicy(), size).worker })
         : undefined,
   });
 
@@ -546,6 +554,7 @@ export function createWorkerGitDeps(options: WorkerGitDepsOptions = {}): WorkerG
       ),
     disposeDeps: () => pool.dispose(),
     workerStats: () => pool.getStats(),
+    updateGitProcessPolicy: (policy) => pool.updateGitProcessPolicy(policy),
   };
 }
 
