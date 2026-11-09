@@ -34,7 +34,11 @@ import {
   configureGitProcessPolicy,
   snapshotGitCommandRuntimeMetrics,
 } from "../utils/run-git-command.js";
-import { DEFAULT_GIT_PROCESS_POLICY } from "../utils/git-process-scheduler.js";
+import {
+  DEFAULT_GIT_PROCESS_POLICY,
+  mainGitProcessPolicy,
+} from "../utils/git-process-scheduler.js";
+import { resolveGitWorkerCount } from "./git-worker/client.js";
 import type {
   HubEnrollment,
   HubEnrollmentResult,
@@ -318,9 +322,14 @@ describe("paseo daemon bootstrap", () => {
           })
         ).status,
       ).toBe(404);
+      // The reload configures the whole cap; main applies its share of it.
+      const reloadedGitPolicy = mainGitProcessPolicy(
+        { maxProcessesPerSecond: 5, maxProcessConcurrency: 1 },
+        resolveGitWorkerCount(process.env),
+      );
       expect(snapshotGitCommandRuntimeMetrics()).toMatchObject({
-        concurrencyLimit: 1,
-        maxProcessesPerSecond: 5,
+        concurrencyLimit: reloadedGitPolicy.maxProcessConcurrency,
+        maxProcessesPerSecond: reloadedGitPolicy.maxProcessesPerSecond,
       });
       await expect(
         daemon.agentManager.createAgent({ provider: "codex", cwd: agentCwd }, undefined, {
