@@ -159,6 +159,9 @@ jobs:
       - name: Verify built-in plugins from built output
         run: node --test scripts/builtin-plugins-dist.test.mjs
 
+      - name: Verify Git worker from built output
+        run: node --test scripts/git-worker-dist.test.mjs
+
       - name: Typecheck all packages
         run: npm run typecheck
 

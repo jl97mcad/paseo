@@ -261,6 +261,8 @@ interface CreateServiceTestOptions {
   runGitFetch?: ReturnType<typeof vi.fn>;
   runGitCommand?: ReturnType<typeof vi.fn>;
   getWorkspaceGitSelfHealPhaseMs?: (cwd: string) => number;
+  workspaceFolderExists?: (cwd: string) => Promise<boolean>;
+  disposeDeps?: ReturnType<typeof vi.fn>;
   now?: () => Date;
 }
 
@@ -764,6 +766,20 @@ describe("WorkspaceGitServiceImpl", () => {
       subscription.unsubscribe();
     }
     service.dispose();
+  });
+
+  test("dispose awaits the dependency owner's teardown once", async () => {
+    let released = false;
+    const disposeDeps = vi.fn(async () => {
+      await Promise.resolve();
+      released = true;
+    });
+    const service = createService({ disposeDeps });
+
+    await Promise.all([service.dispose(), service.dispose()]);
+
+    expect(disposeDeps).toHaveBeenCalledTimes(1);
+    expect(released).toBe(true);
   });
 
   test("dispose settles queued refresh and observation work and cleans late watchers", async () => {
