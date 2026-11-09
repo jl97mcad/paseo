@@ -13,7 +13,9 @@ import {
 import {
   resolveGitProcessPolicy,
   type GitProcessPolicy,
+  type GitProcessPriority,
 } from "../../utils/git-process-scheduler.js";
+import { getGitCommandPriority } from "../../utils/run-git-command.js";
 import type { WorkspaceGitServiceDependencies } from "../workspace-git-service.js";
 import {
   reviveGitWorkerError,
@@ -105,7 +107,7 @@ export function shareGitProcessPolicy(
 }
 
 interface QueuedRequest {
-  request: GitWorkerTask & { id: number };
+  request: GitWorkerTask & { id: number; priority: GitProcessPriority };
   fallback: () => Promise<unknown>;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -139,7 +141,10 @@ export interface GitWorkerPoolOptions {
 export class GitWorkerPool {
   private readonly slots = new Set<WorkerSlot>();
   private readonly inFlight = new Map<WorkerSlot, InFlightRequest>();
-  private readonly queue: QueuedRequest[] = [];
+  // Two lanes: an archive waiting on a read does not queue behind the pollers'
+  // background refreshes. The worker's Git scheduler uses the same split.
+  private readonly highPriorityQueue: QueuedRequest[] = [];
+  private readonly normalPriorityQueue: QueuedRequest[] = [];
   private readonly size: number;
   private readonly entry: GitWorkerEntry;
   private readonly logger: Pick<pino.Logger, "warn"> | undefined;
@@ -168,13 +173,17 @@ export class GitWorkerPool {
     this.workerData = options.workerData;
   }
 
+  private get queued(): number {
+    return this.highPriorityQueue.length + this.normalPriorityQueue.length;
+  }
+
   getStats(): GitWorkerStats {
     return {
       size: this.size,
       enabled: this.size > 0 && !this.disposed && !this.unavailable,
       workers: this.slots.size,
       inFlight: this.inFlight.size,
-      queued: this.queue.length,
+      queued: this.queued,
       dispatched: this.dispatched,
       fallbacks: this.fallbacks,
       dropped: this.dropped,
@@ -190,19 +199,25 @@ export class GitWorkerPool {
       this.fallbacks += 1;
       return fallback();
     }
-    if (this.queue.length >= this.queueLimit) {
+    if (this.queued >= this.queueLimit) {
       this.dropped += 1;
       this.saturatedDrops += 1;
       this.logSaturation();
       return Promise.reject(new GitWorkerQueueFullError(this.queueLimit));
     }
     return new Promise<GitWorkerOutputs[K]>((resolve, reject) => {
-      this.queue.push({
-        request: { ...task, id: this.nextId++ } as QueuedRequest["request"],
+      const priority = getGitCommandPriority();
+      const queued: QueuedRequest = {
+        request: { ...task, id: this.nextId++, priority } as QueuedRequest["request"],
         fallback: fallback as () => Promise<unknown>,
         resolve: resolve as (value: unknown) => void,
         reject,
-      });
+      };
+      if (priority === "high") {
+        this.highPriorityQueue.push(queued);
+      } else {
+        this.normalPriorityQueue.push(queued);
+      }
       this.pump();
     });
   }
@@ -212,7 +227,7 @@ export class GitWorkerPool {
       return this.disposePromise;
     }
     this.disposed = true;
-    const pending = this.queue.splice(0);
+    const pending = [...this.highPriorityQueue.splice(0), ...this.normalPriorityQueue.splice(0)];
     for (const queued of pending) {
       queued.reject(new Error("Git worker pool is disposed"));
     }
@@ -234,7 +249,7 @@ export class GitWorkerPool {
     if (this.disposed) {
       return;
     }
-    while (this.queue.length > 0) {
+    while (this.queued > 0) {
       const slot = this.acquireSlot();
       if (!slot) {
         // Nothing alive: a spawn failed outright, so run the rest on main.
@@ -243,7 +258,7 @@ export class GitWorkerPool {
         }
         return;
       }
-      const queued = this.queue.shift()!;
+      const queued = this.highPriorityQueue.shift() ?? this.normalPriorityQueue.shift()!;
       this.dispatch(slot, queued);
     }
     this.logDrain();
@@ -368,7 +383,7 @@ export class GitWorkerPool {
   }
 
   private drainToFallback(): void {
-    const queued = this.queue.splice(0);
+    const queued = [...this.highPriorityQueue.splice(0), ...this.normalPriorityQueue.splice(0)];
     for (const entry of queued) {
       this.fallbacks += 1;
       void entry.fallback().then(entry.resolve, entry.reject);
