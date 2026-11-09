@@ -64,6 +64,20 @@ export interface GitWorkerCancelConfirmation {
   id: number;
 }
 
+export type GitWorkerLogLevel = "warn" | "error";
+export type GitWorkerLogFields = Record<string, unknown>;
+
+/**
+ * A warning or error the worker logged while it rebuilt its read context; the
+ * daemon logger writes it on main. Trace output stays in the worker.
+ */
+export interface GitWorkerLog {
+  type: "log";
+  level: GitWorkerLogLevel;
+  message: string;
+  fields?: GitWorkerLogFields;
+}
+
 export type GitWorkerMessage = GitWorkerRequest | GitWorkerCancel | GitWorkerPolicy;
 
 export function isGitWorkerCancel(message: GitWorkerMessage): message is GitWorkerCancel {
@@ -84,12 +98,16 @@ export type GitWorkerReply =
   | { id: number; ok: true; value: unknown }
   | { id: number; ok: false; error: GitWorkerErrorPayload };
 
-export type GitWorkerResponse = GitWorkerReply | GitWorkerCancelConfirmation;
+export type GitWorkerResponse = GitWorkerReply | GitWorkerCancelConfirmation | GitWorkerLog;
 
 export function isGitWorkerCancelConfirmation(
   message: GitWorkerResponse,
 ): message is GitWorkerCancelConfirmation {
   return "type" in message && message.type === "cancelled";
+}
+
+export function isGitWorkerLog(message: GitWorkerResponse): message is GitWorkerLog {
+  return "type" in message && message.type === "log";
 }
 
 export function toGitWorkerErrorPayload(cause: unknown): GitWorkerErrorPayload {

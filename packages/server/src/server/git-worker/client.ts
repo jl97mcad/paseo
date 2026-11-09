@@ -23,9 +23,12 @@ import {
 import type { WorkspaceGitServiceDependencies } from "../workspace-git-service.js";
 import {
   isGitWorkerCancelConfirmation,
+  isGitWorkerLog,
   reviveGitWorkerError,
   type GitWorkerCancel,
   type GitWorkerCheckoutInput,
+  type GitWorkerLogFields,
+  type GitWorkerLogLevel,
   type GitWorkerOutputs,
   type GitWorkerPolicy,
   type GitWorkerReply,
@@ -118,6 +121,12 @@ interface InFlightRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+interface WorkerLogEvent {
+  level: GitWorkerLogLevel;
+  message: string;
+  fields?: GitWorkerLogFields;
+}
+
 interface WorkerSlot {
   worker: Worker;
   exited: boolean;
@@ -127,7 +136,7 @@ interface WorkerSlot {
 export interface GitWorkerPoolOptions {
   size: number;
   entry?: GitWorkerEntry;
-  logger?: Pick<pino.Logger, "warn">;
+  logger?: Pick<pino.Logger, "warn" | "error">;
   requestTimeoutMs?: number;
   queueLimit?: number;
   cancelGraceMs?: number;
@@ -153,7 +162,7 @@ export class GitWorkerPool {
   private readonly normalPriorityQueue: QueuedRequest[] = [];
   private readonly size: number;
   private readonly entry: GitWorkerEntry;
-  private readonly logger: Pick<pino.Logger, "warn"> | undefined;
+  private readonly logger: Pick<pino.Logger, "warn" | "error"> | undefined;
   private readonly requestTimeoutMs: number;
   private readonly queueLimit: number;
   private readonly cancelGraceMs: number;
@@ -350,6 +359,10 @@ export class GitWorkerPool {
       }
       return;
     }
+    if (isGitWorkerLog(message)) {
+      this.logWorker({ level: message.level, message: message.message, fields: message.fields });
+      return;
+    }
     const reply: GitWorkerReply = message;
     const inFlight = this.inFlight.get(slot);
     if (!inFlight || inFlight.queued.request.id !== reply.id) {
@@ -480,6 +493,14 @@ export class GitWorkerPool {
     }
   }
 
+  private logWorker(event: WorkerLogEvent): void {
+    if (event.level === "error") {
+      this.logger?.error(event.fields ?? {}, event.message);
+      return;
+    }
+    this.logger?.warn(event.fields ?? {}, event.message);
+  }
+
   private logSaturation(): void {
     if (this.saturationLogged) {
       return;
@@ -518,7 +539,7 @@ export class GitWorkerPool {
 }
 
 export interface WorkerGitDepsOptions {
-  logger?: Pick<pino.Logger, "warn">;
+  logger?: Pick<pino.Logger, "warn" | "error">;
   env?: NodeJS.ProcessEnv;
   size?: number;
   requestTimeoutMs?: number;
