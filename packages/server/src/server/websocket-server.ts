@@ -268,6 +268,7 @@ function createFallbackWorkspaceGitService(): WorkspaceGitService {
     onSnapshotUpdated: () => ({
       unsubscribe: () => {},
     }),
+    hasWorkspaceListener: () => false,
     getCheckout: async (cwd: string) => ({
       cwd,
       isGit: false,
