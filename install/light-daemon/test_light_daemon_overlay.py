@@ -226,13 +226,21 @@ class DryRun(OverlayFixture):
 
 
 class Atomicity(OverlayFixture):
-    def test_mid_apply_failure_restores_every_changed_file(self):
+    def flaky_once(self):
+        """Fail the first write of bootstrap.js only, so rollback can succeed."""
         real = light_daemon_overlay.atomic_write
+        state = {"raised": False}
 
         def flaky(path, data):
-            if path.endswith("bootstrap.js"):
+            if path.endswith("bootstrap.js") and not state["raised"]:
+                state["raised"] = True
                 raise OSError("injected failure")
             real(path, data)
+
+        return flaky
+
+    def test_mid_apply_failure_restores_every_changed_file(self):
+        flaky = self.flaky_once()
 
         before = self.byte_map()
         with mock.patch.object(light_daemon_overlay, "atomic_write", flaky):
@@ -243,15 +251,9 @@ class Atomicity(OverlayFixture):
 
     def test_mid_apply_failure_removes_a_file_it_added(self):
         files = json.loads((self.overlay / "MANIFEST.json").read_text())["files"]
-        files.reverse()  # the added file is written first
+        files.reverse()  # the added file is last in the manifest
         self.write_manifest(files)
-        real = light_daemon_overlay.atomic_write
-
-        def flaky(path, data):
-            if path.endswith("bootstrap.js"):
-                raise OSError("injected failure")
-            real(path, data)
-
+        flaky = self.flaky_once()
         before = self.byte_map()
         with mock.patch.object(light_daemon_overlay, "atomic_write", flaky):
             self.run_refused("apply")
@@ -279,6 +281,153 @@ class Verify(OverlayFixture):
         (self.server / "dist/server/server/agent/agent-manager.js").unlink()
         output = self.run_refused("verify")
         self.assertIn("agent-manager.js", output)
+
+
+class Ordering(OverlayFixture):
+    """Added files are written before changed ones, and removed after they are restored."""
+
+    def record(self):
+        written = []
+        real = light_daemon_overlay.atomic_write
+
+        def recording(path, data):
+            if not path.endswith(light_daemon_overlay.BACKUP_SUFFIX):
+                written.append(os.path.basename(path))
+            real(path, data)
+
+        return written, mock.patch.object(light_daemon_overlay, "atomic_write", recording)
+
+    def test_apply_writes_the_added_file_before_the_changed_files(self):
+        written, patcher = self.record()
+        with patcher:
+            self.assertEqual(self.run_tool("apply")[0], 0)
+        self.assertEqual(written, [os.path.basename(ADDED),
+                                   "workspace-git-service.js", "bootstrap.js"])
+
+    def test_apply_orders_added_first_whatever_the_manifest_order(self):
+        files = json.loads((self.overlay / "MANIFEST.json").read_text())["files"]
+        self.write_manifest(list(reversed(files)))  # added file last
+        written, patcher = self.record()
+        with patcher:
+            self.assertEqual(self.run_tool("apply")[0], 0)
+        self.assertEqual(written[0], os.path.basename(ADDED))
+        self.assertEqual(self.run_tool("verify")[0], 0)
+
+    def test_revert_removes_the_added_file_last(self):
+        self.assertEqual(self.run_tool("apply")[0], 0)
+        removed = []
+        real_remove = os.remove
+
+        def recording(path, *args, **kwargs):
+            removed.append(os.path.basename(path))
+            return real_remove(path, *args, **kwargs)
+
+        written, patcher = self.record()
+        with patcher, mock.patch.object(light_daemon_overlay.os, "remove", recording):
+            self.assertEqual(self.run_tool("revert")[0], 0)
+        self.assertEqual(written, ["bootstrap.js", "workspace-git-service.js"])
+        self.assertEqual(removed[:1], [os.path.basename(ADDED)])
+
+
+class BuilderOrdering(unittest.TestCase):
+    """The build emits entries in the order the installer relies on."""
+
+    def setUp(self):
+        HERE_SPEC = importlib.util.spec_from_file_location(
+            "build_overlay", HERE / "build_overlay.py")
+        self.build = importlib.util.module_from_spec(HERE_SPEC)
+        HERE_SPEC.loader.exec_module(self.build)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def tree(self, name, files):
+        for rel, text in files.items():
+            path = self.root / name / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text if isinstance(text, bytes) else text.encode())
+        return str(self.root / name)
+
+    def test_manifest_lists_added_files_before_changed_ones(self):
+        changed = "dist/server/server/session.js"
+        added = "dist/server/server/session/workspace-git-observer/workspace-liveness.js"
+        stock = self.tree("stock", {changed: "// stock\n", "dist/server/server/quiet.js": "// same\n"})
+        baseline = self.tree("baseline", {changed: "// stock\n", "dist/server/server/quiet.js": "// same\n"})
+        patched = self.tree("patched", {changed: "// patched\n", added: "// added\n",
+                                        "dist/server/server/quiet.js": "// same\n",
+                                        "dist/server/server/map.js.map": "ignored"})
+        out = str(self.root / "overlay")
+        self.assertEqual(self.build.run(stock, baseline, patched, out,
+                                        "@getpaseo/server", "0.15.3"), 0)
+        manifest = json.loads((pathlib.Path(out) / "MANIFEST.json").read_text())
+        self.assertEqual(manifest["version"], "0.15.3")
+        self.assertEqual([entry["path"] for entry in manifest["files"]], [added, changed])
+        self.assertIsNone(manifest["files"][0]["stockSha256"])
+        self.assertEqual(manifest["files"][1]["stockSha256"],
+                         light_daemon_overlay.sha_bytes(b"// stock\n"))
+        self.assertEqual(manifest["files"][1]["sizeBytes"], len(b"// patched\n"))
+        self.assertFalse((pathlib.Path(out) / "dist/server/server/map.js.map").exists())
+        # The installer accepts what the builder wrote.
+        installer = light_daemon_overlay.load_manifest(out)
+        self.assertEqual([entry.path for entry in installer.entries], [added, changed])
+
+    def test_a_dropped_file_refuses(self):
+        gone = "dist/server/server/gone.js"
+        stock = self.tree("stock", {gone: "// stock\n"})
+        baseline = self.tree("baseline", {gone: "// stock\n"})
+        patched = self.tree("patched", {"dist/server/server/new.js": "// new\n"})
+        with self.assertRaises(SystemExit) as caught:
+            self.build.run(stock, baseline, patched, str(self.root / "overlay"),
+                           "@getpaseo/server", "0.15.3")
+        self.assertIn(gone, str(caught.exception.code))
+
+
+class FailureReporting(OverlayFixture):
+    """A rollback that cannot restore must fail loudly instead of claiming success."""
+
+    def test_apply_names_files_it_could_not_restore_and_stays_re_runnable(self):
+        state = {"apply_failed": False}
+        real = light_daemon_overlay.atomic_write
+
+        def flaky(path, data):
+            if path.endswith("bootstrap.js") and not state["apply_failed"]:
+                state["apply_failed"] = True
+                raise OSError("injected apply failure")
+            if state["apply_failed"] and path.endswith("workspace-git-service.js"):
+                raise OSError("injected restore failure")
+            real(path, data)
+
+        with mock.patch.object(light_daemon_overlay, "atomic_write", flaky):
+            output = self.run_refused("apply")
+        self.assertIn("could not restore 1 of 3 file(s)", output)
+        self.assertIn("workspace-git-service.js", output)
+        self.assertNotIn("restored 3 file(s), wrote nothing", output)
+        self.assertNotIn("applied 3 file(s)", output)
+
+        # The stock backups stay, so the same command finishes once the cause is fixed.
+        self.assertIn("bootstrap.js" + light_daemon_overlay.BACKUP_SUFFIX, self.backups())
+        self.assertEqual(self.run_tool("apply")[0], 0)
+        self.assertEqual(self.run_tool("verify")[0], 0)
+
+    def test_revert_names_files_it_could_not_restore(self):
+        self.assertEqual(self.run_tool("apply")[0], 0)
+        real = light_daemon_overlay.atomic_write
+
+        def flaky(path, data):
+            if path.endswith("workspace-git-service.js"):
+                raise OSError("injected restore failure")
+            real(path, data)
+
+        with mock.patch.object(light_daemon_overlay, "atomic_write", flaky):
+            output = self.run_refused("revert")
+        self.assertIn("could not restore", output)
+        self.assertIn("workspace-git-service.js", output)
+        self.assertNotIn("reverted", output)
+        self.assertEqual(len(self.backups()), len(REPLACED))
+        self.assertEqual(self.run_tool("revert")[0], 0)
+        self.assertEqual(self.run_tool("status")[1].splitlines()[-1], "overall: stock")
 
 
 if __name__ == "__main__":

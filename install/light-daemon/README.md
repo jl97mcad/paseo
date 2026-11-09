@@ -24,11 +24,23 @@ python3 light_daemon_overlay.py status|verify|apply|revert \
 | -------- | ------------------------------------------------------------------------------------------------------------------- | ------ | ------- |
 | `status` | prints `stock`, `patched`, `mixed` or `unknown` per file and overall                                                | no     | no      |
 | `verify` | requires every listed file to match `patchedSha256`, then reports the hashes of files the other local patches touch | no     | no      |
-| `apply`  | backs up each stock file as `<name>.light-daemon-stock`, then installs the overlay files                            | yes    | yes     |
-| `revert` | restores the hash-checked stock backups and removes added files                                                     | yes    | yes     |
+| `apply`  | backs up each stock file as `<name>.light-daemon-stock`, then installs the overlay files (added files first)        | yes    | yes     |
+| `revert` | restores the hash-checked stock backups and removes added files, walking the apply order backwards                  | yes    | yes     |
 
 Exit codes: `0` for a completed action and for `status` in `stock`, `patched` or
-`mixed`; `1` for a refusal, an `unknown` file, or an incomplete `verify`.
+`mixed`; `1` for a refusal, an `unknown` file, an incomplete `verify`, or a run
+whose rollback could not restore a file.
+
+Added files are written before changed ones, because a changed file may import
+one the published package does not have yet: `session.js` imports
+`session/workspace-git-observer/workspace-liveness.js`. `revert` restores the
+changed files before it removes the added ones.
+
+If a run fails part-way, it restores everything it had already changed. If one
+of those restores also fails, it exits `1`, names the files it could not
+restore and keeps the stock backups. Those files stay patched and the printed
+state is mixed; re-run the same command once the cause is fixed and it
+finishes the job.
 
 ### System install
 
@@ -96,6 +108,29 @@ package layout.
   the published package does not contain.
 - `patchedSha256` is the overlay file's sha256. `apply` refuses when the file in
   the overlay directory does not hash to it.
+- `files` is ordered added files first, then changed files, each by path. The
+  installer applies in that order whatever the manifest says, and the build
+  script writes the manifest that way; keep the order when editing by hand so
+  the file records what a run does.
+
+## Building an overlay
+
+`build_overlay.py` compares three package roots and writes the overlay directory
+with its `MANIFEST.json`:
+
+```sh
+python3 build_overlay.py \
+    --stock <unpacked `npm pack @getpaseo/server@<version>`> \
+    --baseline <the same version built from its tag> \
+    --patched <build of the changed source> \
+    --out <overlay dir> --version <version>
+```
+
+`--baseline` cancels build-only differences, so the overlay holds what the
+change did and nothing else. Files are compared under `dist/` by
+package-relative path, `*.map` is ignored, a file the patched build adds gets
+`stockSha256: null`, and a file it drops stops the build because an overlay
+cannot remove a file. Entries come out added-first.
 
 ## Coexistence with the other local patches
 
@@ -104,10 +139,11 @@ this overlay check hashes and never inspect versions, so their states compose
 only as documented here.
 
 - **`scoped_idle`** edits `agent/idle-runtime-cleanup/index.js` and
-  `agent/agent-manager.js`. It is independent of this overlay unless the overlay
-  replaces `agent-manager.js`. Then the patch's stock hash is the overlay's
-  previous file, not the published one: the patch needs a new stock→patched hash
-  pair for the overlay's output before it can be applied again.
+  `agent/agent-manager.js`. If it is applied on top of this overlay, revert it
+  first, then the overlay: the overlay cannot write either file while the patch
+  is there, and the patch's stock hash is the overlay's file rather than the
+  published one. It needs a new stock→patched hash pair for the overlay's output
+  before it can be applied again.
 - **`idle_workspace_watch`** edits `workspace-git-service.js` and `bootstrap.js`,
   which this overlay replaces. The overlay supersedes it: revert that patch
   before `apply`, and do not apply it afterwards. Its stock hashes will not match
