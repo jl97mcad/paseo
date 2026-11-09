@@ -9185,7 +9185,7 @@ test("archiveAgent cascades from a caller-supplied active-record snapshot", asyn
     );
   }
   const activeRecords = await manager.listActiveAgentRecords();
-  const listRecords = vi.spyOn(storage, "list");
+  const listRecords = vi.spyOn(storage, "listActive");
 
   await manager.archiveAgent(parent.id, { activeRecords });
 

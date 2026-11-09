@@ -2021,7 +2021,7 @@ export class AgentManager {
 
   /** Active stored records, for a caller that archives many agents in one request. */
   async listActiveAgentRecords(): Promise<StoredAgentRecord[]> {
-    return this.registry ? (await this.registry.list()).filter((record) => !record.archivedAt) : [];
+    return this.registry ? this.registry.listActive() : [];
   }
 
   private async archiveAgentUnlocked(

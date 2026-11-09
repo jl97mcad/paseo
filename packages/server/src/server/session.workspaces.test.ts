@@ -2089,7 +2089,7 @@ test("workspace mark unread selects a finished cross-workspace child with scoped
   session.projectRegistry.list = async () => [project];
   session.projectRegistry.get = async (id: string) => (id === project.projectId ? project : null);
   const home = mkdtempSync(path.join(tmpdir(), "mark-unread-parent-"));
-  const storage = new AgentStorage(path.join(home, "agents"), pino({ level: "silent" }));
+  const storage = new AgentStorage(path.join(home, "agents"), createTestLogger());
   for (const record of storedRecords.values()) await storage.upsert(record);
   const directory = new AgentDirectory({
     storage,
