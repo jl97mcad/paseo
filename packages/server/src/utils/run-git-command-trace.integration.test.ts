@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { threadId } from "node:worker_threads";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushGitCommandTrace } from "./git-command-trace.js";
 import { runGitCommand } from "./run-git-command.js";
@@ -32,6 +33,7 @@ describe("git command trace", () => {
     expect(events[0]).toMatchObject({
       kind: "git_command",
       event: "settled",
+      id: expect.stringMatching(new RegExp(`^${process.pid}:${threadId}:\\d+$`)),
       args: ["--version"],
       cwd: directory,
       queue: {
