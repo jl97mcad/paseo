@@ -30,6 +30,14 @@ const gitCommandPriority = new AsyncLocalStorage<GitProcessPriority>();
 export function runWithGitCommandPriority<T>(priority: GitProcessPriority, operation: () => T): T {
   return gitCommandPriority.run(priority, operation);
 }
+/**
+ * The priority this async context runs at. Callers that cross a thread boundary
+ * have to send it themselves: an AsyncLocalStorage store does not follow a
+ * message into a worker.
+ */
+export function getGitCommandPriority(): GitProcessPriority {
+  return gitCommandPriority.getStore() ?? "normal";
+}
 
 function createGitCommandRuntimeMetricsWindow(policy: GitProcessPolicy) {
   return new GitCommandRuntimeMetricsWindow({
@@ -558,9 +566,7 @@ function executeGitCommand<Output>(
     });
     return { result: resultPromise, exited };
   };
-  const promise = gitProcessScheduler.run(startCommand, {
-    priority: gitCommandPriority.getStore() ?? "normal",
-  });
+  const promise = gitProcessScheduler.run(startCommand, { priority: getGitCommandPriority() });
   gitRuntimeMetrics.observeLimiter(
     gitProcessScheduler.activeCount,
     gitProcessScheduler.pendingCount,

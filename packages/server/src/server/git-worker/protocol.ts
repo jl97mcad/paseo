@@ -5,6 +5,7 @@ import type {
   CheckoutStatusResult,
   CheckoutWorktreeState,
 } from "../../utils/checkout-git.js";
+import type { GitProcessPriority } from "../../utils/git-process-scheduler.js";
 
 /**
  * The checkout reads that run inside the Git worker. Every input and output is
@@ -40,7 +41,7 @@ export interface GitWorkerOutputs {
   refDerived: CheckoutRefDerivedState;
 }
 
-export type GitWorkerRequest = GitWorkerTask & { id: number };
+export type GitWorkerRequest = GitWorkerTask & { id: number; priority: GitProcessPriority };
 
 export interface GitWorkerErrorPayload {
   name: string;
