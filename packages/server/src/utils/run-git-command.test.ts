@@ -251,6 +251,17 @@ describe("runGitCommand", () => {
     expect(fakeSpawnController.activeCount).toBe(0);
   });
 
+  it("refuses a command whose caller already aborted, without spawning", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    const controller = new AbortController();
+    controller.abort(new Error("no longer needed"));
+
+    await expect(
+      runGitCommand(["status"], { cwd: process.cwd(), signal: controller.signal }),
+    ).rejects.toThrow("no longer needed");
+    expect(fakeSpawnController.processes).toHaveLength(0);
+  });
+
   it("kills timed out processes and releases the limiter slot", async () => {
     const { runGitCommand } = await loadRunGitCommand(1);
 

@@ -19,7 +19,7 @@ interface GitCommandTraceQueueState {
 }
 
 interface GitCommandTraceSettlement {
-  outcome: "closed" | "spawn_error" | "timed_out";
+  outcome: "closed" | "spawn_error" | "timed_out" | "cancelled";
   exitCode?: number | null;
   signal?: NodeJS.Signals | null;
   truncated?: boolean;

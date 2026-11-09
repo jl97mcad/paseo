@@ -43,6 +43,27 @@ export interface GitWorkerOutputs {
 
 export type GitWorkerRequest = GitWorkerTask & { id: number; priority: GitProcessPriority };
 
+/**
+ * Retire-time abort. The pool sends it before terminating a worker so the
+ * commands still running in that thread can kill their process trees.
+ */
+export interface GitWorkerCancel {
+  type: "cancel";
+  id: number;
+}
+
+/** The worker's promise that the cancelled request has settled. */
+export interface GitWorkerCancelConfirmation {
+  type: "cancelled";
+  id: number;
+}
+
+export type GitWorkerMessage = GitWorkerRequest | GitWorkerCancel;
+
+export function isGitWorkerCancel(message: GitWorkerMessage): message is GitWorkerCancel {
+  return "type" in message && message.type === "cancel";
+}
+
 export interface GitWorkerErrorPayload {
   name: string;
   message: string;
@@ -52,6 +73,14 @@ export interface GitWorkerErrorPayload {
 export type GitWorkerReply =
   | { id: number; ok: true; value: unknown }
   | { id: number; ok: false; error: GitWorkerErrorPayload };
+
+export type GitWorkerResponse = GitWorkerReply | GitWorkerCancelConfirmation;
+
+export function isGitWorkerCancelConfirmation(
+  message: GitWorkerResponse,
+): message is GitWorkerCancelConfirmation {
+  return "type" in message && message.type === "cancelled";
+}
 
 export function toGitWorkerErrorPayload(cause: unknown): GitWorkerErrorPayload {
   if (!(cause instanceof Error)) {
