@@ -18,16 +18,24 @@ import {
 import { getGitCommandPriority } from "../../utils/run-git-command.js";
 import type { WorkspaceGitServiceDependencies } from "../workspace-git-service.js";
 import {
+  isGitWorkerCancelConfirmation,
   reviveGitWorkerError,
+  type GitWorkerCancel,
   type GitWorkerCheckoutInput,
   type GitWorkerOutputs,
   type GitWorkerReply,
+  type GitWorkerResponse,
   type GitWorkerTask,
 } from "./protocol.js";
 
 export const DEFAULT_GIT_WORKER_COUNT = 2;
 export const DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_GIT_WORKER_QUEUE_LIMIT = 256;
+/**
+ * How long a retired worker may take to confirm that it stopped its Git
+ * processes before the pool terminates the thread anyway.
+ */
+export const DEFAULT_GIT_WORKER_CANCEL_GRACE_MS = 1_000;
 /** Consecutive failures this close together mean the worker cannot hold work. */
 const RAPID_FAILURE_WINDOW_MS = 5_000;
 const RAPID_FAILURE_LIMIT = 3;
@@ -120,6 +128,8 @@ interface InFlightRequest {
 
 interface WorkerSlot {
   worker: Worker;
+  exited: boolean;
+  cancelWait?: { id: number; confirm: () => void };
 }
 
 export interface GitWorkerPoolOptions {
@@ -128,6 +138,7 @@ export interface GitWorkerPoolOptions {
   logger?: Pick<pino.Logger, "warn">;
   requestTimeoutMs?: number;
   queueLimit?: number;
+  cancelGraceMs?: number;
   /** Structured-clone data handed to every worker; the Git policy share lives here. */
   workerData?: () => unknown;
 }
@@ -150,6 +161,7 @@ export class GitWorkerPool {
   private readonly logger: Pick<pino.Logger, "warn"> | undefined;
   private readonly requestTimeoutMs: number;
   private readonly queueLimit: number;
+  private readonly cancelGraceMs: number;
   private readonly workerData: (() => unknown) | undefined;
   private nextId = 1;
   private disposed = false;
@@ -170,6 +182,7 @@ export class GitWorkerPool {
     this.logger = options.logger;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS;
     this.queueLimit = options.queueLimit ?? DEFAULT_GIT_WORKER_QUEUE_LIMIT;
+    this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_GIT_WORKER_CANCEL_GRACE_MS;
     this.workerData = options.workerData;
   }
 
@@ -233,15 +246,18 @@ export class GitWorkerPool {
     }
     const slots = [...this.slots];
     this.slots.clear();
-    const inFlight = [...this.inFlight.values()];
-    this.inFlight.clear();
-    for (const entry of inFlight) {
+    const requestIds = new Map<WorkerSlot, number>();
+    for (const [slot, entry] of this.inFlight) {
       clearTimeout(entry.timer);
+      requestIds.set(slot, entry.queued.request.id);
       entry.queued.reject(new Error("Git worker pool is disposed"));
     }
-    this.disposePromise = Promise.all(slots.map((slot) => slot.worker.terminate())).then(
-      () => undefined,
-    );
+    this.inFlight.clear();
+    // Dispose stops in-flight Git commands the same way a retirement does, so a
+    // shutdown does not leave the last read's processes behind.
+    this.disposePromise = Promise.all(
+      slots.map((slot) => this.stopWorker(slot, requestIds.get(slot))),
+    ).then(() => undefined);
     return this.disposePromise;
   }
 
@@ -288,14 +304,15 @@ export class GitWorkerPool {
       this.noteFailure(error);
       return null;
     }
-    const slot: WorkerSlot = { worker };
+    const slot: WorkerSlot = { worker, exited: false };
     this.slots.add(slot);
     worker.unref();
-    worker.on("message", (reply: GitWorkerReply) => this.onMessage(slot, reply));
+    worker.on("message", (message: GitWorkerResponse) => this.onMessage(slot, message));
     worker.on("error", (error: Error) => this.onWorkerFailure(slot, error));
-    worker.on("exit", (code: number) =>
-      this.onWorkerFailure(slot, new Error(`Git worker exited (code ${code})`)),
-    );
+    worker.on("exit", (code: number) => {
+      slot.exited = true;
+      this.onWorkerFailure(slot, new Error(`Git worker exited (code ${code})`));
+    });
     return slot;
   }
 
@@ -307,7 +324,16 @@ export class GitWorkerPool {
     slot.worker.postMessage(queued.request, []);
   }
 
-  private onMessage(slot: WorkerSlot, reply: GitWorkerReply): void {
+  private onMessage(slot: WorkerSlot, message: GitWorkerResponse): void {
+    if (isGitWorkerCancelConfirmation(message)) {
+      const wait = slot.cancelWait;
+      if (wait && wait.id === message.id) {
+        slot.cancelWait = undefined;
+        wait.confirm();
+      }
+      return;
+    }
+    const reply: GitWorkerReply = message;
     const inFlight = this.inFlight.get(slot);
     if (!inFlight || inFlight.queued.request.id !== reply.id) {
       return;
@@ -333,7 +359,7 @@ export class GitWorkerPool {
       inFlight.queued.request.op,
       this.requestTimeoutMs,
     );
-    this.retire(slot, error);
+    this.retire(slot, error, inFlight.queued.request.id);
     inFlight.queued.reject(error);
   }
 
@@ -346,7 +372,7 @@ export class GitWorkerPool {
       this.finish(slot, inFlight);
       inFlight.queued.reject(error);
     }
-    this.retire(slot, error);
+    this.retire(slot, error, inFlight?.queued.request.id);
   }
 
   private finish(slot: WorkerSlot, inFlight: InFlightRequest): void {
@@ -357,12 +383,52 @@ export class GitWorkerPool {
     }
   }
 
-  private retire(slot: WorkerSlot, error: Error): void {
+  private retire(slot: WorkerSlot, error: Error, requestId?: number): void {
     this.slots.delete(slot);
     this.retirements += 1;
-    void slot.worker.terminate();
+    void this.stopWorker(slot, requestId);
     this.noteFailure(error);
     this.pump();
+  }
+
+  /**
+   * Terminating a thread does not kill the processes it spawned. Ask the worker
+   * to abort the request it is holding, give it a bounded moment to confirm that
+   * the abort took its Git processes with it, then terminate.
+   */
+  private async stopWorker(slot: WorkerSlot, requestId: number | undefined): Promise<void> {
+    if (slot.exited) {
+      await slot.worker.terminate();
+      return;
+    }
+    if (requestId !== undefined) {
+      await this.waitForCancelConfirmation(slot, requestId);
+    }
+    await slot.worker.terminate();
+  }
+
+  private waitForCancelConfirmation(slot: WorkerSlot, requestId: number): Promise<void> {
+    let settle: () => void = () => undefined;
+    const confirmed = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    // The grace is a bound, not a deadline: a worker that died without
+    // confirming must not hold the slot's engine open.
+    const timer = setTimeout(() => settle(), this.cancelGraceMs);
+    timer.unref?.();
+    slot.cancelWait = {
+      id: requestId,
+      confirm: () => {
+        clearTimeout(timer);
+        settle();
+      },
+    };
+    try {
+      slot.worker.postMessage({ type: "cancel", id: requestId } satisfies GitWorkerCancel, []);
+    } catch {
+      // The thread already died; the grace timer bounds this and terminate is a no-op.
+    }
+    return confirmed;
   }
 
   private noteFailure(cause: unknown): void {

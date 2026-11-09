@@ -25,6 +25,10 @@ interface FakeWorkerBehaviour {
   replyWithWorkerData?: boolean;
   /** Echo the request's operation and priority instead of a canned value. */
   echoRequest?: boolean;
+  /** Set `[0] = 1` on the received cancel, then confirm it. */
+  cancelFlags?: Int32Array;
+  /** Receive the cancel but never confirm it. */
+  ignoreCancel?: boolean;
 }
 
 function createFakeWorker(behaviour: FakeWorkerBehaviour = {}): GitWorkerEntry {
@@ -36,8 +40,19 @@ const { parentPort, workerData } = require("node:worker_threads");
 const holdAttempts = ${JSON.stringify(behaviour.holdAttempts ?? [])};
 const exitAttempts = ${JSON.stringify(behaviour.exitAttempts ?? [])};
 const failWith = ${JSON.stringify(behaviour.failWith ?? null)};
+const ignoreCancel = ${behaviour.ignoreCancel === true};
+const cancelFlags = (workerData && workerData.cancelFlags) || null;
 const attempt = (workerData && workerData.attempt) || 0;
 parentPort.on("message", (request) => {
+  if (request && request.type === "cancel") {
+    if (cancelFlags) {
+      cancelFlags[0] = 1;
+    }
+    if (!ignoreCancel) {
+      parentPort.postMessage({ type: "cancelled", id: request.id });
+    }
+    return;
+  }
   if (exitAttempts.includes(attempt)) {
     process.exit(0);
   }
@@ -211,6 +226,42 @@ describe("git worker pool", () => {
 
       await Promise.all([held, firstNormal, secondNormal, high]);
       expect(served).toEqual(["worktreeState", "checkoutStatus", "shortstat"]);
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("cancels the held request in the worker before terminating the thread", async () => {
+    const cancelFlags = new Int32Array(new SharedArrayBuffer(4));
+    const pool = createPool({
+      entry: createFakeWorker({ holdAttempts: [0], cancelFlags }),
+      workerData: () => ({ cancelFlags }),
+      requestTimeoutMs: 100,
+    });
+    try {
+      await expect(readSnapshot(pool)).rejects.toMatchObject({
+        name: "GitWorkerRequestTimeoutError",
+      });
+      await vi.waitFor(() => expect(cancelFlags[0]).toBe(1));
+      expect(pool.getStats()).toMatchObject({ retirements: 1 });
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("terminates a worker that never confirms the cancel, bounded by the grace", async () => {
+    const pool = createPool({
+      entry: createFakeWorker({ holdAttempts: [0], ignoreCancel: true }),
+      workerData: createAttempts(),
+      requestTimeoutMs: 100,
+      cancelGraceMs: 20,
+    });
+    try {
+      await expect(readSnapshot(pool)).rejects.toMatchObject({
+        name: "GitWorkerRequestTimeoutError",
+      });
+      await expect(readStatus(pool)).resolves.toEqual({ cwd: "/tmp/workspace", attempt: 1 });
+      expect(pool.getStats()).toMatchObject({ retirements: 1, workers: 1 });
     } finally {
       await pool.dispose();
     }
