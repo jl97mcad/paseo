@@ -29,6 +29,8 @@ interface FakeWorkerBehaviour {
   ignoreCancel?: boolean;
   /** Record the `[concurrency, rate]` of every policy message it receives. */
   policyRecords?: Int32Array;
+  /** Post this log event before answering any request. */
+  logWith?: { level: "warn" | "error"; message: string; fields?: Record<string, unknown> };
 }
 
 function createFakeWorker(behaviour: FakeWorkerBehaviour = {}): GitWorkerEntry {
@@ -40,6 +42,7 @@ const { parentPort, workerData } = require("node:worker_threads");
 const holdAttempts = ${JSON.stringify(behaviour.holdAttempts ?? [])};
 const exitAttempts = ${JSON.stringify(behaviour.exitAttempts ?? [])};
 const failWith = ${JSON.stringify(behaviour.failWith ?? null)};
+const logWith = ${JSON.stringify(behaviour.logWith ?? null)};
 const ignoreCancel = ${behaviour.ignoreCancel === true};
 const cancelFlags = (workerData && workerData.cancelFlags) || null;
 const policyRecords = (workerData && workerData.policyRecords) || null;
@@ -60,6 +63,9 @@ parentPort.on("message", (request) => {
       policyRecords[1] = request.policy.maxProcessesPerSecond;
     }
     return;
+  }
+  if (logWith) {
+    parentPort.postMessage({ type: "log", ...logWith });
   }
   if (exitAttempts.includes(attempt)) {
     process.exit(0);
@@ -496,6 +502,30 @@ describe("git worker pool", () => {
       await readSnapshot(pool);
       pool.updateGitProcessPolicy({ maxProcessConcurrency: 8, maxProcessesPerSecond: 64 });
       await vi.waitFor(() => expect(Array.from(policyRecords)).toEqual([4, 32]));
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("posts worker warnings to the daemon logger and drops trace", async () => {
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    const pool = createPool({
+      entry: createFakeWorker({
+        logWith: {
+          level: "warn",
+          message: "Git worktree discovery failed; treating directory as non-Git",
+          fields: { cwd: "/tmp/workspace" },
+        },
+      }),
+      logger,
+    });
+    try {
+      await readSnapshot(pool);
+      expect(logger.warn).toHaveBeenCalledWith(
+        { cwd: "/tmp/workspace" },
+        "Git worktree discovery failed; treating directory as non-Git",
+      );
+      expect(logger.error).not.toHaveBeenCalled();
     } finally {
       await pool.dispose();
     }

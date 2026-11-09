@@ -1,4 +1,5 @@
 import { parentPort, workerData } from "node:worker_threads";
+import type { Logger } from "pino";
 import {
   getCheckoutRefDerivedState,
   getCheckoutShortstat,
@@ -22,6 +23,7 @@ import {
   isGitWorkerCancel,
   isGitWorkerPolicy,
   toGitWorkerErrorPayload,
+  type GitWorkerLogFields,
   type GitWorkerMessage,
   type GitWorkerReply,
   type GitWorkerRequest,
@@ -39,6 +41,36 @@ export interface GitWorkerTaskHandlerOptions {
 }
 
 /**
+ * A warn/error sink for the reads. It posts plain, clone-safe log events back to
+ * main, where the daemon logger writes them; trace output is dropped.
+ */
+function createWorkerLogger(
+  post: (message: GitWorkerResponse) => void,
+): Pick<Logger, "trace" | "warn"> {
+  const warn = (fields: unknown, message?: string): void => {
+    const text = typeof fields === "string" ? fields : (message ?? "");
+    const context = typeof fields === "string" ? undefined : fields;
+    post({ type: "log", level: "warn", message: text, fields: toLogFields(context) });
+  };
+  return {
+    trace: () => undefined,
+    warn: warn as Logger["warn"],
+  };
+}
+
+function toLogFields(fields: unknown): GitWorkerLogFields | undefined {
+  if (!fields || typeof fields !== "object") {
+    return undefined;
+  }
+  try {
+    return structuredClone(fields) as GitWorkerLogFields;
+  } catch {
+    // A non-cloneable field must not lose the warning itself.
+    return { note: "log fields were not cloneable" };
+  }
+}
+
+/**
  * One request at a time, as the pool admits it. A request may be cancelled
  * while it runs: `cancel` aborts the commands it spawned, and the request's
  * reply confirms the abort once every process it started is gone. The pool
@@ -47,6 +79,7 @@ export interface GitWorkerTaskHandlerOptions {
  */
 export function createGitWorkerTaskHandler(options: GitWorkerTaskHandlerOptions) {
   const runCommand = options.runGitCommand ?? runGitCommand;
+  const logger = createWorkerLogger(options.post);
   const controllers = new Map<number, AbortController>();
   const cancelled = new Set<number>();
 
@@ -59,7 +92,7 @@ export function createGitWorkerTaskHandler(options: GitWorkerTaskHandlerOptions)
         // priority, and an AsyncLocalStorage store does not cross the message
         // boundary, so the request carries it.
         const value = await runWithGitCommandPriority(request.priority, () =>
-          execute(request, runCommand, controller.signal),
+          execute(request, runCommand, controller.signal, logger),
         );
         options.post({ id: request.id, ok: true, value } satisfies GitWorkerReply);
       } catch (cause) {
@@ -121,14 +154,17 @@ function execute(
   task: GitWorkerTask,
   runCommand: RunGitCommand,
   signal: AbortSignal,
+  logger: Pick<Logger, "trace" | "warn">,
 ): Promise<unknown> {
-  // The caller's logger and provenance wrapper stay on main; the reads only
-  // need the facts, the observation roots, and a command runner of their own.
+  // The reads rebuild the context from the request: the probe facts, the
+  // observation roots, a command runner and a logger sink that posts warnings
+  // back to main. Error handling and provenance stay on main.
   // Every command carries the request's abort signal, so a cancelled request
   // takes its Git children with it.
   const context: CheckoutContext = {
     paseoHome: task.input.paseoHome,
     worktreesRoot: task.input.worktreesRoot,
+    logger,
     runGitCommand: (args, commandOptions) => runCommand(args, { ...commandOptions, signal }),
   };
   switch (task.op) {
