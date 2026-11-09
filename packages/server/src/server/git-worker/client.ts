@@ -19,6 +19,7 @@ import {
 import {
   DEFAULT_GIT_COMMAND_TIMEOUT_MS,
   getGitCommandPriority,
+  runWithGitCommandPriority,
 } from "../../utils/run-git-command.js";
 import type { WorkspaceGitServiceDependencies } from "../workspace-git-service.js";
 import {
@@ -424,7 +425,12 @@ export class GitWorkerPool {
   /** The in-thread path serves any request the pool could not. */
   private runFallback(queued: QueuedRequest): void {
     this.fallbacks += 1;
-    void queued.fallback().then(queued.resolve, queued.reject);
+    // The fallback may run from a timer or worker callback, so it gets the priority of the caller
+    // that queued it instead of whatever store that callback happens to hold.
+    void runWithGitCommandPriority(queued.request.priority, queued.fallback).then(
+      queued.resolve,
+      queued.reject,
+    );
   }
 
   private finish(slot: WorkerSlot, inFlight: InFlightRequest): void {
