@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { GitProcessPolicy } from "../../utils/git-process-scheduler.js";
+import { runWithGitCommandPriority } from "../../utils/run-git-command.js";
 import {
   GitWorkerPool,
   GitWorkerQueueFullError,
@@ -22,12 +23,12 @@ interface FakeWorkerBehaviour {
   failWith?: { name: string; message: string; code?: string };
   /** Reply with the worker's own workerData instead of a request echo. */
   replyWithWorkerData?: boolean;
+  /** Echo the request's operation and priority instead of a canned value. */
+  echoRequest?: boolean;
 }
 
 function createFakeWorker(behaviour: FakeWorkerBehaviour = {}): GitWorkerEntry {
-  const replyWith = behaviour.replyWithWorkerData
-    ? "workerData"
-    : "{ cwd: request.input.cwd, attempt }";
+  const replyWith = replyExpression(behaviour);
   return {
     eval: true,
     script: `
@@ -69,6 +70,36 @@ function createPool(options: Partial<GitWorkerPoolOptions> = {}): GitWorkerPool 
 
 function fallbackValue(cwd: string): Promise<{ cwd: string; fallback: true }> {
   return Promise.resolve({ cwd, fallback: true });
+}
+
+function replyExpression(behaviour: FakeWorkerBehaviour): string {
+  if (behaviour.replyWithWorkerData) {
+    return "workerData";
+  }
+  if (behaviour.echoRequest) {
+    return "{ op: request.op, priority: request.priority }";
+  }
+  return "{ cwd: request.input.cwd, attempt }";
+}
+
+function readSnapshot(pool: GitWorkerPool): Promise<unknown> {
+  return pool.run({ op: "snapshotFacts", input }, () => fallbackValue(""));
+}
+
+function readStatus(pool: GitWorkerPool): Promise<unknown> {
+  return pool.run({ op: "checkoutStatus", input }, () => fallbackValue(""));
+}
+
+function readShortstat(pool: GitWorkerPool): Promise<unknown> {
+  return pool.run({ op: "shortstat", input: { ...input, force: true } }, () => fallbackValue(""));
+}
+
+function readWorktreeState(pool: GitWorkerPool): Promise<unknown> {
+  return pool.run({ op: "worktreeState", input }, () => fallbackValue(""));
+}
+
+function readAtHighPriority(read: () => Promise<unknown>): Promise<unknown> {
+  return runWithGitCommandPriority("high", read);
 }
 
 describe("git worker entry resolution", () => {
@@ -142,6 +173,44 @@ describe("git worker pool", () => {
       expect(data).toEqual({
         gitProcessPolicy: { maxProcessConcurrency: 4, maxProcessesPerSecond: 32 },
       });
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("sends the caller's Git priority with the request", async () => {
+    const pool = createPool({ entry: createFakeWorker({ echoRequest: true }) });
+    try {
+      const high = await readAtHighPriority(() => readSnapshot(pool));
+      const normal = await readStatus(pool);
+      expect(high).toEqual({ op: "snapshotFacts", priority: "high" });
+      expect(normal).toEqual({ op: "checkoutStatus", priority: "normal" });
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("serves a high-priority request ahead of the normal requests already queued", async () => {
+    const pool = createPool({
+      entry: createFakeWorker({ holdAttempts: [0], echoRequest: true }),
+      workerData: createAttempts(),
+      requestTimeoutMs: 100,
+    });
+    const served: string[] = [];
+    const record = (promise: Promise<unknown>) =>
+      promise.then(
+        (value) => served.push((value as { op: string }).op),
+        () => undefined,
+      );
+    try {
+      // The first request holds the only slot, so the rest wait in the queue.
+      const held = record(readSnapshot(pool));
+      const firstNormal = record(readStatus(pool));
+      const secondNormal = record(readShortstat(pool));
+      const high = record(readAtHighPriority(() => readWorktreeState(pool)));
+
+      await Promise.all([held, firstNormal, secondNormal, high]);
+      expect(served).toEqual(["worktreeState", "checkoutStatus", "shortstat"]);
     } finally {
       await pool.dispose();
     }
