@@ -5,7 +5,7 @@ import type {
   CheckoutStatusResult,
   CheckoutWorktreeState,
 } from "../../utils/checkout-git.js";
-import type { GitProcessPriority } from "../../utils/git-process-scheduler.js";
+import type { GitProcessPolicy, GitProcessPriority } from "../../utils/git-process-scheduler.js";
 
 /**
  * The checkout reads that run inside the Git worker. Every input and output is
@@ -43,6 +43,12 @@ export interface GitWorkerOutputs {
 
 export type GitWorkerRequest = GitWorkerTask & { id: number; priority: GitProcessPriority };
 
+/** A live Git policy change, with the share the pool derived for this thread. */
+export interface GitWorkerPolicy {
+  type: "policy";
+  policy: GitProcessPolicy;
+}
+
 /**
  * Retire-time abort. The pool sends it before terminating a worker so the
  * commands still running in that thread can kill their process trees.
@@ -58,10 +64,14 @@ export interface GitWorkerCancelConfirmation {
   id: number;
 }
 
-export type GitWorkerMessage = GitWorkerRequest | GitWorkerCancel;
+export type GitWorkerMessage = GitWorkerRequest | GitWorkerCancel | GitWorkerPolicy;
 
 export function isGitWorkerCancel(message: GitWorkerMessage): message is GitWorkerCancel {
   return "type" in message && message.type === "cancel";
+}
+
+export function isGitWorkerPolicy(message: GitWorkerMessage): message is GitWorkerPolicy {
+  return "type" in message && message.type === "policy";
 }
 
 export interface GitWorkerErrorPayload {
