@@ -12,6 +12,7 @@ import {
   submitGitCommandTrace,
 } from "./git-command-trace.js";
 import { spawnProcess } from "./spawn.js";
+import { signalProcessTree } from "./tree-kill.js";
 import {
   GitProcessScheduler,
   type GitProcessPriority,
@@ -58,6 +59,12 @@ export interface GitCommandOptions {
   envOverlay?: ProcessEnvRecord;
   logger?: Pick<Logger, "trace">;
   timeout?: number;
+  /**
+   * Cancels a command that no longer matters, e.g. one still running when its
+   * worker is retired. Aborting kills the whole Git process tree: hooks and
+   * helpers are grandchildren the caller cannot reap itself.
+   */
+  signal?: AbortSignal;
   maxOutputBytes?: number;
   acceptExitCodes?: number[];
 }
@@ -288,6 +295,10 @@ function executeGitCommand<Output>(
   decode: (output: Buffer) => Output,
   provenance?: string,
 ): Promise<GitCommandResult<Output>> {
+  if (options.signal?.aborted) {
+    // A caller that already gave up is not worth a queue slot or a spawn.
+    return Promise.reject(abortSignalError(options.signal, formatGitCommand(args)));
+  }
   const metricsState = submitGitCommandMetric(args, options.cwd);
   const commandTrace = submitGitCommandTrace(args, options.cwd, {
     active: gitProcessScheduler.activeCount,
@@ -334,17 +345,20 @@ function executeGitCommand<Output>(
       let processError: Error | null = null;
       let processExit: { exitCode: number | null; signal: NodeJS.Signals | null } | null = null;
       let timeoutError: Error | null = null;
+      let abortError: Error | null = null;
       let truncated = false;
       let stdoutBytes = 0;
       let stderrBytes = 0;
       const stdoutChunks: Buffer[] = [];
       const stderrChunks: Buffer[] = [];
       let timer: NodeJS.Timeout | undefined;
+      let removeAbortListener: (() => void) | undefined;
 
       const settle = (callback: () => void) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        removeAbortListener?.();
         callback();
       };
 
@@ -417,6 +431,19 @@ function executeGitCommand<Output>(
         rejectSpawnFailure(error);
         return;
       }
+
+      // Registered only once the child exists: the executor above already
+      // refused an aborted signal, and nothing awaits between the two.
+      const onAbort = () => {
+        abortError = abortSignalError(options.signal, command);
+        const error = abortError;
+        void signalProcessTree(child, "SIGKILL").finally(() => {
+          settleGitCommandTrace(commandTrace, { outcome: "cancelled", signal: "SIGKILL" });
+          settle(() => reject(error));
+        });
+      };
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
 
       const stdout = child.stdout;
       const stderr = child.stderr;
@@ -526,7 +553,7 @@ function executeGitCommand<Output>(
           );
         }
 
-        if (timeoutError) {
+        if (timeoutError || abortError) {
           return;
         }
 
@@ -578,6 +605,17 @@ export const runGitCommand: RunGitCommand = runGitCommandWithProvenance;
 
 function formatGitCommand(args: string[]): string {
   return ["git", ...args].join(" ");
+}
+
+function abortSignalError(signal: AbortSignal | undefined, command: string): Error {
+  const reason: unknown = signal?.reason;
+  if (reason instanceof Error) {
+    return reason;
+  }
+  const error = new Error(`Git command aborted: ${command}`);
+  error.name = "AbortError";
+  (error as { code?: string }).code = "ABORT_ERR";
+  return error;
 }
 
 function getGitOperation(args: string[]): string {
