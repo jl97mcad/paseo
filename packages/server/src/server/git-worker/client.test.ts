@@ -531,6 +531,29 @@ describe("git worker pool", () => {
     }
   });
 
+  it("does not resolve the worker entry until a worker spawns", async () => {
+    const resolveEntry = vi.fn(() => createFakeWorker());
+    const disabled = new GitWorkerPool({ size: 0, resolveEntry });
+    try {
+      await expect(
+        disabled.run({ op: "snapshotFacts", input }, () => fallbackValue(input.cwd)),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", fallback: true });
+      expect(resolveEntry).not.toHaveBeenCalled();
+    } finally {
+      await disabled.dispose();
+    }
+
+    const enabled = new GitWorkerPool({ size: 1, resolveEntry });
+    try {
+      await expect(
+        enabled.run({ op: "snapshotFacts", input }, () => fallbackValue("")),
+      ).resolves.toEqual({ cwd: "/tmp/workspace", attempt: 0 });
+      expect(resolveEntry).toHaveBeenCalledTimes(1);
+    } finally {
+      await enabled.dispose();
+    }
+  });
+
   it("runs in-thread when the pool is disabled", async () => {
     const pool = createPool({ size: 0 });
     try {

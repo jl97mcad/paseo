@@ -136,6 +136,8 @@ interface WorkerSlot {
 export interface GitWorkerPoolOptions {
   size: number;
   entry?: GitWorkerEntry;
+  /** Resolved only when the pool actually spawns a worker. */
+  resolveEntry?: () => GitWorkerEntry;
   logger?: Pick<pino.Logger, "warn" | "error">;
   requestTimeoutMs?: number;
   queueLimit?: number;
@@ -161,7 +163,8 @@ export class GitWorkerPool {
   private readonly highPriorityQueue: QueuedRequest[] = [];
   private readonly normalPriorityQueue: QueuedRequest[] = [];
   private readonly size: number;
-  private readonly entry: GitWorkerEntry;
+  private readonly resolveEntry: () => GitWorkerEntry;
+  private entry: GitWorkerEntry | null;
   private readonly logger: Pick<pino.Logger, "warn" | "error"> | undefined;
   private readonly requestTimeoutMs: number;
   private readonly queueLimit: number;
@@ -183,7 +186,9 @@ export class GitWorkerPool {
 
   constructor(options: GitWorkerPoolOptions) {
     this.size = Math.max(0, options.size);
-    this.entry = options.entry ?? resolveGitWorkerEntry();
+    this.resolveEntry = options.resolveEntry ?? resolveGitWorkerEntry;
+    // A pool that never spawns must not need the worker entry, and with it tsx.
+    this.entry = this.size > 0 ? (options.entry ?? null) : null;
     this.logger = options.logger;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS;
     this.queueLimit = options.queueLimit ?? DEFAULT_GIT_WORKER_QUEUE_LIMIT;
@@ -319,10 +324,12 @@ export class GitWorkerPool {
   }
 
   private spawnSlot(): WorkerSlot | null {
+    // Resolved on the first spawn, so a disabled pool never loads the entry.
+    const entry = (this.entry ??= this.resolveEntry());
     let worker: Worker;
     try {
-      worker = new Worker(this.entry.script, {
-        eval: this.entry.eval,
+      worker = new Worker(entry.script, {
+        eval: entry.eval,
         execArgv: [],
         ...(this.workerData ? { workerData: this.workerData() } : {}),
       });
