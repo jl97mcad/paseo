@@ -134,6 +134,31 @@ function createManagedAgent(overrides: ManagedAgentOverrides = {}): ManagedAgent
   };
 }
 
+/** Records which stored ids a list path looked up, so a test can prove it skipped archived history. */
+function trackRecordReads(storage: AgentStorage): { reads: string[]; reset(): void } {
+  const internal = storage as unknown as { cache: Map<string, unknown> };
+  const reads: string[] = [];
+  const tracked = new Proxy(internal.cache, {
+    get(cache, property) {
+      if (property === "get") {
+        return (agentId: string) => {
+          reads.push(agentId);
+          return cache.get(agentId);
+        };
+      }
+      const value = Reflect.get(cache, property, cache);
+      return typeof value === "function" ? value.bind(cache) : value;
+    },
+  });
+  internal.cache = tracked;
+  return {
+    reads,
+    reset: () => {
+      reads.length = 0;
+    },
+  };
+}
+
 describe("AgentStorage", () => {
   let tmpDir: string;
   let storagePath: string;
@@ -189,6 +214,122 @@ describe("AgentStorage", () => {
     await reloaded.remove("a");
     expect(await reloaded.listActive()).toEqual([]);
     expect(await reloaded.lastUserMessageAtByWorkspace(["two"])).toEqual(new Map());
+  });
+
+  test("default list paths read only non-archived records out of a large history", async () => {
+    const base = {
+      provider: "codex",
+      cwd: tmpDir,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      labels: {},
+    };
+    const archivedRecord = (id: string, workspaceId: string) => ({
+      ...base,
+      id,
+      workspaceId,
+      archivedAt: "2026-02-01T00:00:00.000Z",
+    });
+    await fs.mkdir(storagePath, { recursive: true });
+    for (let offset = 0; offset < 5000; offset += 200) {
+      await Promise.all(
+        Array.from({ length: 200 }, (_, index) => {
+          const id = `archived-${offset + index}`;
+          return fs.writeFile(
+            path.join(storagePath, `${id}.json`),
+            JSON.stringify(archivedRecord(id, index % 2 ? "one" : "two")),
+          );
+        }),
+      );
+    }
+    await storage.initialize();
+    for (let index = 0; index < 5; index += 1) {
+      await storage.upsert({
+        ...base,
+        id: `live-${index}`,
+        workspaceId: index % 2 ? "one" : "two",
+      });
+    }
+
+    const reference = (await storage.listAll())
+      .filter((record) => !record.archivedAt)
+      .map((record) => record.id);
+    const allIds = (await storage.listAll()).map((record) => record.id);
+    const reads = trackRecordReads(storage);
+
+    expect((await storage.listActive()).map((record) => record.id)).toEqual(reference);
+    expect(new Set(reads.reads)).toEqual(new Set(reference));
+
+    reads.reset();
+    expect(
+      (await storage.listByWorkspaces(["one", "two"])).map((record) => record.id).sort(),
+    ).toEqual([...reference].sort());
+    expect(new Set(reads.reads)).toEqual(new Set(reference));
+
+    // The archived history is still reachable when the request asks for it.
+    reads.reset();
+    expect((await storage.listActive({ includeArchived: true })).length).toBe(allIds.length);
+    expect(new Set(reads.reads)).toEqual(new Set(allIds));
+  });
+
+  test("active workspace listing follows archive, unarchive, removal, and new records", async () => {
+    const base = {
+      provider: "codex",
+      cwd: tmpDir,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      labels: {},
+    };
+    const earliest = "2026-01-02T00:00:00.000Z";
+    const latest = "2026-01-03T00:00:00.000Z";
+    const archivedAt = "2026-02-01T00:00:00.000Z";
+    const listIds = async (workspaceIds: string[], includeArchived = false) =>
+      (await storage.listByWorkspaces(workspaceIds, { includeArchived }))
+        .map((record) => record.id)
+        .sort();
+
+    await storage.upsert({ ...base, id: "a", workspaceId: "one", lastUserMessageAt: earliest });
+    await storage.upsert({ ...base, id: "b", workspaceId: "one", lastUserMessageAt: latest });
+    await storage.upsert({
+      ...base,
+      id: "c",
+      workspaceId: "one",
+      archivedAt,
+      lastUserMessageAt: earliest,
+    });
+    expect(await listIds(["one"])).toEqual(["a", "b"]);
+    expect(await listIds(["one"], true)).toEqual(["a", "b", "c"]);
+
+    // The memoised human recency still counts archived agents and drops removed ones.
+    expect(await storage.lastUserMessageAtByWorkspace(["one"])).toEqual(new Map([["one", latest]]));
+    await storage.upsert({ ...(await storage.get("b"))!, archivedAt });
+    expect(await listIds(["one"])).toEqual(["a"]);
+    expect(await storage.lastUserMessageAtByWorkspace(["one"])).toEqual(new Map([["one", latest]]));
+
+    await storage.upsert({ ...(await storage.get("c"))!, archivedAt: null });
+    expect(await listIds(["one"])).toEqual(["a", "c"]);
+
+    await storage.upsert({ ...base, id: "d", workspaceId: "two" });
+    expect(await listIds(["one", "two"])).toEqual(["a", "c", "d"]);
+
+    await storage.remove("b");
+    expect(await storage.lastUserMessageAtByWorkspace(["one"])).toEqual(
+      new Map([["one", earliest]]),
+    );
+    await storage.remove("a");
+    expect(await listIds(["one"])).toEqual(["c"]);
+    expect(await storage.lastUserMessageAtByWorkspace(["one"])).toEqual(
+      new Map([["one", earliest]]),
+    );
+    await storage.remove("c");
+    expect(await storage.lastUserMessageAtByWorkspace(["one"])).toEqual(new Map());
+
+    await storage.flush();
+    const reloaded = new AgentStorage(storagePath, createTestLogger());
+    await reloaded.initialize();
+    expect(
+      (await reloaded.listByWorkspaces(["one", "two"])).map((record) => record.id).sort(),
+    ).toEqual(["d"]);
   });
 
   test("single-agent lookups keep allocations bounded with a large stored history", async () => {
