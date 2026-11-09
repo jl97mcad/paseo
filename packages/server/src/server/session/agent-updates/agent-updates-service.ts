@@ -43,7 +43,10 @@ export interface AgentUpdatesService {
   clearSubscription(subscriptionId: string): void;
   hasSubscription(): boolean;
   includesLiveAgent(agent: ManagedAgent, subscriptionIds?: ReadonlySet<string>): Promise<boolean>;
-  forwardLiveAgent(agent: ManagedAgent): Promise<void>;
+  forwardLiveAgent(
+    agent: ManagedAgent,
+    lastStatus?: StoredAgentRecord["lastStatus"],
+  ): Promise<void>;
   forwardStoredAgent(record: StoredAgentRecord): Promise<void>;
   emitStoredRecord(record: StoredAgentRecord): Promise<AgentSnapshotPayload>;
   removeAgent(agentId: string): Promise<void>;
@@ -330,14 +333,17 @@ export function createAgentUpdatesService(deps: AgentUpdatesServiceDeps): AgentU
     return next;
   }
 
-  function forwardLiveAgent(agent: ManagedAgent): Promise<void> {
+  function forwardLiveAgent(
+    agent: ManagedAgent,
+    lastStatus?: StoredAgentRecord["lastStatus"],
+  ): Promise<void> {
     if (!hasSubscription()) {
       const workspaceId = agent.workspaceId;
       return workspaceId
         ? enqueueAgentUpdate(agent.id, () => emitAgentUpdate(workspaceId))
         : Promise.resolve();
     }
-    const payload = toAgentPayload(agent);
+    const payload = toAgentPayload(agent, lastStatus ? { lastStatus } : undefined);
     return enqueueAgentUpdate(payload.id, () =>
       emitAgentUpdate(payload.workspaceId, () => deps.enrichAgentPayload(payload)),
     );
