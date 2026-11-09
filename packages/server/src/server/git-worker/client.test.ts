@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { mainGitProcessPolicy, splitGitProcessPolicy } from "../../utils/git-process-scheduler.js";
-import { runWithGitCommandPriority } from "../../utils/run-git-command.js";
+import { getGitCommandPriority, runWithGitCommandPriority } from "../../utils/run-git-command.js";
 import {
   GitWorkerPool,
   resolveGitWorkerCount,
@@ -526,6 +526,25 @@ describe("git worker pool", () => {
         "Git worktree discovery failed; treating directory as non-Git",
       );
       expect(logger.error).not.toHaveBeenCalled();
+    } finally {
+      await pool.dispose();
+    }
+  });
+
+  it("keeps the caller's Git priority when a queued read falls back after another timed out", async () => {
+    const pool = createPool({
+      entry: createFakeWorker({ holdAttempts: [0, 1] }),
+      workerData: createAttempts(),
+      requestTimeoutMs: 100,
+    });
+    const readPriority = async () => getGitCommandPriority();
+    try {
+      // The normal read holds the only slot; the high read dispatches from the normal read's
+      // timeout, so its own timeout must not inherit that context's priority.
+      const held = readSnapshot(pool);
+      const high = readAtHighPriority(() => pool.run({ op: "snapshotFacts", input }, readPriority));
+      await held;
+      await expect(high).resolves.toBe("high");
     } finally {
       await pool.dispose();
     }
