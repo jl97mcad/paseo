@@ -16,7 +16,10 @@ import {
   type GitProcessPolicy,
   type GitProcessPriority,
 } from "../../utils/git-process-scheduler.js";
-import { getGitCommandPriority } from "../../utils/run-git-command.js";
+import {
+  DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+  getGitCommandPriority,
+} from "../../utils/run-git-command.js";
 import type { WorkspaceGitServiceDependencies } from "../workspace-git-service.js";
 import {
   isGitWorkerCancelConfirmation,
@@ -31,7 +34,11 @@ import {
 } from "./protocol.js";
 
 export const DEFAULT_GIT_WORKER_COUNT = 2;
-export const DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS = 30_000;
+/**
+ * One pooled request runs a whole read of several Git commands, each with the
+ * per-command timeout, so the request budget is a multiple of it.
+ */
+export const DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS = 4 * DEFAULT_GIT_COMMAND_TIMEOUT_MS;
 export const DEFAULT_GIT_WORKER_QUEUE_LIMIT = 256;
 /**
  * How long a retired worker may take to confirm that it stopped its Git
@@ -41,6 +48,8 @@ export const DEFAULT_GIT_WORKER_CANCEL_GRACE_MS = 1_000;
 /** Consecutive failures this close together mean the worker cannot hold work. */
 const RAPID_FAILURE_WINDOW_MS = 5_000;
 const RAPID_FAILURE_LIMIT = 3;
+/** How long the pool reads in-thread before it tries its threads again. */
+const RAPID_FAILURE_COOLDOWN_MS = 60_000;
 /** How a worker entry is started: an ordinary file/URL, or eval'd loader source. */
 export interface GitWorkerEntry {
   script: string | URL;
@@ -57,13 +66,6 @@ export interface GitWorkerStats {
   fallbacks: number;
   dropped: number;
   retirements: number;
-}
-
-export class GitWorkerQueueFullError extends Error {
-  constructor(readonly limit: number) {
-    super(`Git worker queue is full (${limit} requests waiting)`);
-    this.name = "GitWorkerQueueFullError";
-  }
 }
 
 export class GitWorkerRequestTimeoutError extends Error {
@@ -129,15 +131,18 @@ export interface GitWorkerPoolOptions {
   requestTimeoutMs?: number;
   queueLimit?: number;
   cancelGraceMs?: number;
+  /** How long the pool reads in-thread after repeated rapid failures. */
+  recoveryCooldownMs?: number;
   /** Structured-clone data handed to every worker; the Git policy share lives here. */
   workerData?: () => unknown;
 }
 
 /**
  * One thread per concurrent read, a bounded queue in front of them, and the
- * in-thread implementation as the fallback. A worker that errors, exits or
- * times out is retired and replaced lazily; repeated rapid failures disable the
- * pool so snapshots degrade to today's behaviour instead of failing.
+ * in-thread implementation as the fallback. Any pool failure runs that same
+ * read in-thread, so the pool never rejects a read the in-thread path can
+ * serve. A worker that errors, exits or times out is retired and replaced
+ * lazily; repeated rapid failures disable the pool until a cooldown passes.
  */
 export class GitWorkerPool {
   private readonly slots = new Set<WorkerSlot>();
@@ -152,6 +157,7 @@ export class GitWorkerPool {
   private readonly requestTimeoutMs: number;
   private readonly queueLimit: number;
   private readonly cancelGraceMs: number;
+  private readonly recoveryCooldownMs: number;
   private readonly workerData: (() => unknown) | undefined;
   private nextId = 1;
   private disposed = false;
@@ -173,6 +179,7 @@ export class GitWorkerPool {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_GIT_WORKER_REQUEST_TIMEOUT_MS;
     this.queueLimit = options.queueLimit ?? DEFAULT_GIT_WORKER_QUEUE_LIMIT;
     this.cancelGraceMs = options.cancelGraceMs ?? DEFAULT_GIT_WORKER_CANCEL_GRACE_MS;
+    this.recoveryCooldownMs = options.recoveryCooldownMs ?? RAPID_FAILURE_COOLDOWN_MS;
     this.workerData = options.workerData;
   }
 
@@ -198,15 +205,18 @@ export class GitWorkerPool {
     task: Extract<GitWorkerTask, { op: K }>,
     fallback: () => Promise<GitWorkerOutputs[K]>,
   ): Promise<GitWorkerOutputs[K]> {
-    if (this.disposed || this.unavailable || this.size === 0) {
+    if (this.disposed || this.size === 0 || !this.recovered()) {
       this.fallbacks += 1;
       return fallback();
     }
     if (this.queued >= this.queueLimit) {
+      // The queue protects the main thread from admitting work; it must not turn
+      // a burst into a failed read, so the read runs in-thread instead.
       this.dropped += 1;
       this.saturatedDrops += 1;
+      this.fallbacks += 1;
       this.logSaturation();
-      return Promise.reject(new GitWorkerQueueFullError(this.queueLimit));
+      return fallback();
     }
     return new Promise<GitWorkerOutputs[K]>((resolve, reject) => {
       const priority = getGitCommandPriority();
@@ -282,6 +292,23 @@ export class GitWorkerPool {
     return this.spawnSlot();
   }
 
+  /** Re-enable the pool once the cooldown after the last rapid failure passed. */
+  private recovered(): boolean {
+    if (!this.unavailable) {
+      return true;
+    }
+    if (Date.now() - this.lastFailureAtMs < this.recoveryCooldownMs) {
+      return false;
+    }
+    this.unavailable = false;
+    this.rapidFailures = 0;
+    this.logger?.warn(
+      { cooldownMs: this.recoveryCooldownMs },
+      "Git worker pool cooled down; trying worker threads again",
+    );
+    return true;
+  }
+
   private spawnSlot(): WorkerSlot | null {
     let worker: Worker;
     try {
@@ -350,7 +377,7 @@ export class GitWorkerPool {
       this.requestTimeoutMs,
     );
     this.retire(slot, error, inFlight.queued.request.id);
-    inFlight.queued.reject(error);
+    this.runFallback(inFlight.queued);
   }
 
   private onWorkerFailure(slot: WorkerSlot, error: Error): void {
@@ -360,9 +387,17 @@ export class GitWorkerPool {
     const inFlight = this.inFlight.get(slot);
     if (inFlight) {
       this.finish(slot, inFlight);
-      inFlight.queued.reject(error);
     }
     this.retire(slot, error, inFlight?.queued.request.id);
+    if (inFlight) {
+      this.runFallback(inFlight.queued);
+    }
+  }
+
+  /** The in-thread path serves any request the pool could not. */
+  private runFallback(queued: QueuedRequest): void {
+    this.fallbacks += 1;
+    void queued.fallback().then(queued.resolve, queued.reject);
   }
 
   private finish(slot: WorkerSlot, inFlight: InFlightRequest): void {
@@ -441,8 +476,7 @@ export class GitWorkerPool {
   private drainToFallback(): void {
     const queued = [...this.highPriorityQueue.splice(0), ...this.normalPriorityQueue.splice(0)];
     for (const entry of queued) {
-      this.fallbacks += 1;
-      void entry.fallback().then(entry.resolve, entry.reject);
+      this.runFallback(entry);
     }
   }
 
@@ -453,7 +487,7 @@ export class GitWorkerPool {
     this.saturationLogged = true;
     this.logger?.warn(
       { limit: this.queueLimit, size: this.size },
-      "Git worker queue is full; rejecting reads until it drains",
+      "Git worker queue is full; reading in-thread until it drains",
     );
   }
 

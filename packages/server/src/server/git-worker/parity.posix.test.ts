@@ -58,11 +58,11 @@ exec "${realGit.trim()}" "$@"
     const workerDeps = createWorkerGitDeps({ size: 1, requestTimeoutMs: 3_000 });
     workerPools.push(workerDeps);
     try {
-      const error = await workerDeps
-        .getCheckoutStatus(workspace, {})
-        .catch((cause: unknown) => cause);
-      expect(error).toMatchObject({ name: "GitWorkerRequestTimeoutError" });
-      expect(workerDeps.workerStats()).toMatchObject({ retirements: 1 });
+      // The timed-out read finishes in-thread once its blocked Git call is gone.
+      await expect(workerDeps.getCheckoutStatus(workspace, {})).resolves.toMatchObject({
+        isGit: false,
+      });
+      expect(workerDeps.workerStats()).toMatchObject({ retirements: 1, fallbacks: 1 });
 
       const pids = (await readFile(pidFile, "utf8"))
         .trim()

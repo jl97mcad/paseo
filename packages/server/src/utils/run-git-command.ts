@@ -20,7 +20,7 @@ import {
   type GitProcessPolicy,
 } from "./git-process-scheduler.js";
 
-const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_GIT_COMMAND_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_OUTPUT_BYTES = 20 * 1024 * 1024; // 20MB
 const DEFAULT_STDERR_LIMIT = 2048;
 
@@ -316,7 +316,7 @@ function executeGitCommand<Output>(
         pending: gitProcessScheduler.pendingCount,
       });
       gitRuntimeMetrics.start(runtimeMetric);
-      const timeout = options.timeout ?? DEFAULT_TIMEOUT_MS;
+      const timeout = options.timeout ?? DEFAULT_GIT_COMMAND_TIMEOUT_MS;
       const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
       const acceptExitCodes = options.acceptExitCodes ?? [0];
       const command = formatGitCommand(args);
