@@ -32,8 +32,6 @@ export type GitWorkerTask =
   | { op: "worktreeState"; input: GitWorkerCheckoutInput }
   | { op: "refDerived"; input: GitWorkerRefDerivedInput };
 
-export type GitWorkerTaskOp = GitWorkerTask["op"];
-
 export interface GitWorkerOutputs {
   snapshotFacts: CheckoutSnapshotFacts;
   checkoutStatus: CheckoutStatusResult;
