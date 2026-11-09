@@ -9,6 +9,8 @@ interface FakeSpawnBehavior {
   exitCode?: number | null;
   killCloseDelayMs?: number;
   killExitDelayMs?: number;
+  /** A non-positive pid keeps the fake off any real process tree. */
+  pid?: number;
   spawnError?: Error;
   stderrData?: Buffer | string;
   stdoutData?: Buffer | string;
@@ -57,7 +59,7 @@ class FakeChildProcess extends EventEmitter {
   public constructor(behavior: FakeSpawnBehavior) {
     super();
     this.behavior = behavior;
-    this.pid = fakeSpawnController.nextPid;
+    this.pid = this.behavior.pid ?? fakeSpawnController.nextPid;
     fakeSpawnController.nextPid += 1;
 
     fakeSpawnController.activeCount += 1;
@@ -260,6 +262,27 @@ describe("runGitCommand", () => {
       runGitCommand(["status"], { cwd: process.cwd(), signal: controller.signal }),
     ).rejects.toThrow("no longer needed");
     expect(fakeSpawnController.processes).toHaveLength(0);
+  });
+
+  it("kills a command that aborted while it waited for a limiter slot", async () => {
+    const { runGitCommand } = await loadRunGitCommand(1);
+    // The second command cannot start until the first exits, so aborting it
+    // here always lands while it is queued. A pid of 0 keeps the kill off any
+    // real process tree: the fake records the signal instead.
+    enqueueSpawnBehaviors({ delayMs: 20 }, { pid: 0, delayMs: 5_000 });
+
+    const first = runGitCommand(["status"], { cwd: process.cwd() });
+    const controller = new AbortController();
+    const queued = runGitCommand(["rev-parse", "--show-toplevel"], {
+      cwd: process.cwd(),
+      signal: controller.signal,
+    });
+    controller.abort(new Error("no longer needed"));
+
+    await expect(queued).rejects.toThrow("no longer needed");
+    await expect(first).resolves.toMatchObject({ exitCode: 0 });
+    expect(fakeSpawnController.processes).toHaveLength(2);
+    expect(fakeSpawnController.processes[1]?.killSignals).toEqual(["SIGKILL"]);
   });
 
   it("kills timed out processes and releases the limiter slot", async () => {
