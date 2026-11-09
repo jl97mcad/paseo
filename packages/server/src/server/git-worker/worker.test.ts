@@ -39,6 +39,33 @@ describe("git worker task handler", () => {
     }
   });
 
+  it("posts a read's warnings to main and drops its trace output", async () => {
+    let warned = false;
+    const runner: RunGitCommand = async (_args, options) => {
+      options.logger?.trace("Spawning git command");
+      if (!warned) {
+        warned = true;
+        options.logger?.warn(
+          { cwd: "/tmp/workspace" },
+          "Git worktree discovery failed; treating directory as non-Git",
+        );
+      }
+      throw new Error("Not a git repository");
+    };
+    const { handler, replies } = collectingHandler(runner);
+
+    await handler.run({ id: 5, op: "snapshotFacts", input, priority: "normal" });
+
+    expect(replies.filter((reply) => "type" in reply && reply.type === "log")).toEqual([
+      {
+        type: "log",
+        level: "warn",
+        message: "Git worktree discovery failed; treating directory as non-Git",
+        fields: { cwd: "/tmp/workspace" },
+      },
+    ]);
+  });
+
   it("aborts a cancelled request's commands and confirms once they settle", async () => {
     let aborted = false;
     const runner: RunGitCommand = (_args, options) =>
@@ -58,10 +85,11 @@ describe("git worker task handler", () => {
     expect(aborted).toBe(true);
     await running;
 
-    expect(replies.map((reply) => ("type" in reply ? reply.type : reply.id))).toEqual([
-      7,
-      "cancelled",
-    ]);
+    expect(
+      replies
+        .map((reply) => ("type" in reply ? reply.type : reply.id))
+        .filter((entry) => entry !== "log"),
+    ).toEqual([7, "cancelled"]);
   });
 
   it("replies without confirming a cancel for a request that already settled", async () => {
