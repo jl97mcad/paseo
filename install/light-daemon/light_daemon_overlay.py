@@ -11,10 +11,14 @@ overlay copies, after checking every file hash against a manifest:
 
 Nothing else is written. An unknown file hash, a package name or version that
 differs from the manifest, or an overlay file that does not match its manifest
-hash stops the run before the first write. Each replaced file keeps a
+hash stops the run before the first write. Added files are written before
+changed ones, so a changed file never imports a file the run has not written
+yet; `revert` walks that order backwards. Each replaced file keeps a
 `<name>.light-daemon-stock` backup, an existing backup is never overwritten,
 and a failure part-way through restores every file the run had already
-changed. Re-run `apply` after every reinstall or upgrade.
+changed. A restore that itself fails exits non-zero, names the files it could
+not restore and keeps the backups, so the same command finishes the job once
+the cause is fixed. Re-run `apply` after every reinstall or upgrade.
 
 Usage:
   light_daemon_overlay.py status|verify|apply|revert \
@@ -216,9 +220,54 @@ def current_states(server, manifest):
     return states
 
 
+def apply_order(entries):
+    """Added files first: a changed file may import one the package does not hold yet.
+
+    `session.js` imports `session/workspace-git-observer/workspace-liveness.js`, which the
+    published package lacks, so writing the importer first leaves a broken tree for as long as
+    the run takes. Reverting walks this order backwards, restoring changed files before the
+    added files they may import are removed.
+    """
+    return sorted(entries, key=lambda entry: entry.stock is not None)
+
+
+def rollback(journal, created_backups=()):
+    """Undo a journal in reverse; return the files whose restore raised OSError.
+
+    Backups are kept when any restore failed: they are the only copy of the stock bytes, and a
+    re-run needs them. A file left patched is still a state `apply` or `revert` can finish from.
+    """
+    failed = []
+    for target, previous in reversed(journal):
+        try:
+            if previous is None:
+                if os.path.exists(target):
+                    os.remove(target)
+            else:
+                atomic_write(target, previous)
+        except OSError:
+            failed.append(target)
+    if not failed:
+        for backup in created_backups:
+            if os.path.exists(backup):
+                os.remove(backup)
+    return failed
+
+
+def fail_with_restore(action, error, journal, failed):
+    """Exit non-zero, naming what could not be restored and how to finish the run."""
+    if failed:
+        raise SystemExit(
+            f"{action} failed: {error}; could not restore {len(failed)} of {len(journal)} "
+            f"file(s):\n  " + "\n  ".join(failed)
+            + "\nThe stock backups are kept; re-run the same command once the cause is fixed."
+        )
+    raise SystemExit(f"{action} failed: {error}; restored {len(journal)} file(s), wrote nothing")
+
+
 def run_apply(server, manifest, dry_run):
     states = current_states(server, manifest)
-    todo = [entry for entry in manifest.entries if states[entry.path] == "stock"]
+    todo = [entry for entry in apply_order(manifest.entries) if states[entry.path] == "stock"]
     for entry in todo:
         if entry.stock is not None:
             check_backup(entry, server)
@@ -245,28 +294,14 @@ def run_apply(server, manifest, dry_run):
                     shutil.copymode(target, backup)
             atomic_write(target, entry.overlay_bytes)
     except BaseException as error:
-        restored = 0
-        for target, previous in reversed(journal):
-            try:
-                if previous is None:
-                    if os.path.exists(target):
-                        os.remove(target)
-                else:
-                    atomic_write(target, previous)
-                restored += 1
-            except OSError:
-                pass
-        for backup in created_backups:
-            if os.path.exists(backup):
-                os.remove(backup)
-        raise SystemExit(f"apply failed: {error}; restored {restored} file(s), wrote nothing")
+        fail_with_restore("apply", error, journal, rollback(journal, created_backups))
     print(f"applied {len(todo)} file(s)")
 
 
 def run_revert(server, manifest, dry_run):
     states = current_states(server, manifest)
     plan = []
-    for entry in manifest.entries:
+    for entry in apply_order(manifest.entries):
         state, target = states[entry.path], os.path.join(server, entry.path)
         if entry.stock is None:
             if state == "patched":
@@ -283,6 +318,7 @@ def run_revert(server, manifest, dry_run):
                 f"refusing: {backup} has sha256 {sha_bytes(stock)}, not the manifest's stock {entry.stock}"
             )
         plan.append((entry, target, stock))
+    plan.reverse()
     for entry, target, stock in plan:
         print(f"{'would ' if dry_run else ''}{'remove' if stock is None else 'restore'}: {target}")
     if not plan:
@@ -300,18 +336,7 @@ def run_revert(server, manifest, dry_run):
             else:
                 atomic_write(target, stock)
     except BaseException as error:
-        restored = 0
-        for target, previous in reversed(journal):
-            try:
-                if previous is None:
-                    if os.path.exists(target):
-                        os.remove(target)
-                else:
-                    atomic_write(target, previous)
-                restored += 1
-            except OSError:
-                pass
-        raise SystemExit(f"revert failed: {error}; restored {restored} file(s), wrote nothing")
+        fail_with_restore("revert", error, journal, rollback(journal))
     print(f"reverted {len(plan)} file(s)")
 
 
