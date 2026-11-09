@@ -172,7 +172,11 @@ import { resolvePaseoToolPolicy } from "./agent/paseo-tool-policy.js";
 import { BrowserToolsBroker } from "./browser-tools/broker.js";
 import { DaemonConfigBrowserToolsPolicy } from "./browser-tools/policy.js";
 import { WorkspaceGitServiceImpl } from "./workspace-git-service.js";
-import { createWorkerGitDeps, resolveGitWorkerCount } from "./git-worker/client.js";
+import {
+  createWorkerGitDeps,
+  resolveGitWorkerCount,
+  type GitWorkerStats,
+} from "./git-worker/client.js";
 import { resolveWorkspaceIdForPath } from "./resolve-workspace-id-for-path.js";
 import {
   archiveByScope,
@@ -505,6 +509,8 @@ export interface PaseoDaemon {
   stop(options?: { keepTerminals?: boolean }): Promise<void>;
   getListenTarget(): ListenTarget | null;
   getServerId(): string;
+  /** Health of the Git worker pool: dispatch, fallback and retirement counts. */
+  getGitWorkerStats(): GitWorkerStats;
 }
 
 export interface PaseoDaemonDependencies {
@@ -2080,6 +2086,7 @@ export async function createPaseoDaemon(
     stop,
     getListenTarget: () => boundListenTarget,
     getServerId: () => serverId,
+    getGitWorkerStats: () => workerGitDeps.workerStats(),
   };
 }
 
