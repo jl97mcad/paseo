@@ -17,6 +17,9 @@ result
 .dev.vars
 **/.dev.vars
 
+# Python bytecode
+__pycache__/
+
 # Logs
 *.log
 npm-debug.log*
