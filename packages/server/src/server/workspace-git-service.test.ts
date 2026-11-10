@@ -12,6 +12,7 @@ import type {
 import {
   WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
   WORKSPACE_GIT_REFRESH_CONCURRENCY,
+  WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS,
   WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS,
   WorkspaceGitServiceImpl,
   type WorkspaceGitRuntimeSnapshot,
@@ -263,6 +264,7 @@ interface CreateServiceTestOptions {
   getWorkspaceGitSelfHealPhaseMs?: (cwd: string) => number;
   workspaceFolderExists?: (cwd: string) => Promise<boolean>;
   disposeDeps?: ReturnType<typeof vi.fn>;
+  logger?: ReturnType<typeof createLogger>;
   now?: () => Date;
 }
 
@@ -320,7 +322,7 @@ function createService(options?: CreateServiceTestOptions) {
       };
     });
   return new WorkspaceGitServiceImpl({
-    logger: createLogger() as unknown as pino.Logger,
+    logger: (options?.logger ?? createLogger()) as unknown as pino.Logger,
     paseoHome: "/tmp/paseo-test",
     deps,
   });
@@ -780,6 +782,105 @@ describe("WorkspaceGitServiceImpl", () => {
 
     expect(disposeDeps).toHaveBeenCalledTimes(1);
     expect(released).toBe(true);
+  });
+
+  test("dispose stops waiting for a refresh that settles only after the drain bound", async () => {
+    const statusGate = createDeferred<CheckoutStatusGit>();
+    const disposeDeps = vi.fn(async () => {});
+    const logger = createLogger();
+    const getCheckoutStatus = vi.fn(() => statusGate.promise);
+    const service = createService({ getCheckoutStatus, disposeDeps, logger });
+
+    const refresh = service
+      .getSnapshot(REPO_CWD, { includeForge: false, force: true, reason: "test" })
+      .catch(() => undefined);
+    await vi.waitFor(() => {
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    });
+
+    let disposedAt: number | null = null;
+    const disposal = service.dispose().finally(() => {
+      disposedAt = Date.now();
+    });
+
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS - 1);
+    expect(disposeDeps).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => {
+      expect(disposeDeps).toHaveBeenCalledTimes(1);
+    });
+    expect(disposedAt).not.toBeNull();
+
+    statusGate.resolve(createCheckoutStatus(REPO_CWD));
+    await refresh;
+    await disposal;
+  });
+
+  test("dispose awaits a refresh that settles within the drain bound", async () => {
+    const statusGate = createDeferred<CheckoutStatusGit>();
+    const disposeDeps = vi.fn(async () => {});
+    const getCheckoutStatus = vi.fn(() => statusGate.promise);
+    const service = createService({ getCheckoutStatus, disposeDeps });
+
+    const refresh = service
+      .getSnapshot(REPO_CWD, { includeForge: false, force: true, reason: "test" })
+      .catch(() => undefined);
+    await vi.waitFor(() => {
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(1);
+    });
+
+    const disposal = service.dispose();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(disposeDeps).not.toHaveBeenCalled();
+
+    statusGate.resolve(createCheckoutStatus(REPO_CWD));
+    await refresh;
+    await disposal;
+
+    expect(disposeDeps).toHaveBeenCalledTimes(1);
+  });
+
+  test("dispose warns once when the drain bound is hit", async () => {
+    const cwds = [
+      path.resolve("/tmp/dispose-slow-repo-0"),
+      path.resolve("/tmp/dispose-slow-repo-1"),
+    ];
+    const gates = new Map(cwds.map((cwd) => [cwd, createDeferred<CheckoutStatusGit>()]));
+    const logger = createLogger();
+    const getCheckoutStatus = vi.fn((cwd: string) => {
+      const gate = gates.get(cwd);
+      if (!gate) throw new Error(`Unexpected cwd: ${cwd}`);
+      return gate.promise;
+    });
+    const service = createService({ getCheckoutStatus, logger });
+
+    const refreshes: Array<Promise<unknown>> = [];
+    for (const cwd of cwds) {
+      refreshes.push(
+        service
+          .getSnapshot(cwd, { includeForge: false, force: true, reason: "test" })
+          .catch(() => undefined),
+      );
+    }
+    await vi.waitFor(() => {
+      expect(getCheckoutStatus).toHaveBeenCalledTimes(cwds.length);
+    });
+
+    const disposal = service.dispose();
+    await vi.advanceTimersByTimeAsync(WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS);
+    await disposal;
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith(
+      { count: cwds.length, timeoutMs: WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS },
+      expect.any(String),
+    );
+
+    for (const cwd of cwds) {
+      gates.get(cwd)!.resolve(createCheckoutStatus(cwd));
+    }
+    await Promise.all(refreshes);
   });
 
   test("dispose settles queued refresh and observation work and cleans late watchers", async () => {
