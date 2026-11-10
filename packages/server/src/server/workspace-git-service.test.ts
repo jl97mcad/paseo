@@ -1,3 +1,4 @@
+import { FileObservationLimitError } from "./file-observer/index.js";
 import { createWorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import os from "node:os";
@@ -1527,6 +1528,33 @@ describe("WorkspaceGitServiceImpl", () => {
 
     service.dispose();
   });
+
+  test("a working tree past the recursive observation limit stays on polling and is not re-subscribed", async () => {
+    let attempts = 0;
+    const subscribe = vi.fn(async (directory: string) => {
+      if (directory === REPO_CWD) {
+        attempts += 1;
+        throw new FileObservationLimitError("Recursive file observation exceeded 5000 directories");
+      }
+      return createAsyncSubscription();
+    });
+    const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
+    const service = createService({ subscribe, getCheckoutStatus });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    try {
+      await settle(() => expect(attempts).toBe(1));
+      await waitForObservationToSettle(service, 1);
+      const readsBeforePoll = getCheckoutStatus.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+      await waitForRefreshesToSettle(service);
+      expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(readsBeforePoll);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(attempts).toBe(1);
+    } finally {
+      subscription.unsubscribe();
+      await service.dispose();
+    }
+  }, 15_000);
 
   test("sets a bounded polling fallback when recursive observation is unavailable", async () => {
     const subscribe = vi.fn(async () => {
