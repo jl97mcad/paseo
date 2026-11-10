@@ -129,6 +129,9 @@ const WORKING_TREE_KNOWN_DIRECTORIES_MAX = 50_000;
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
+// A refresh reads Git through commands that carry no abort signal, and systemd kills the daemon
+// at 90 s. Bound the shutdown drain so one slow read cannot outlast the stop timeout.
+export const WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS = 10_000;
 const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
 // Giving up permanently leaves polling as the only behaviour until a daemon
 // restart, which kills running agents. Back off, but keep trying.
@@ -1206,10 +1209,14 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.workingTreeWatchAliases.clear();
     this.snapshotUpdatedListeners.clear();
     // Unsubscribing can remove a target while its Git command still owns the cwd.
-    // Stop admission first, then drain those refreshes and the parent lookups they start,
-    // before releasing the dependencies' process-level resources (Git worker threads).
+    // Stop admission first, then drain those refreshes (bounded, so a slow read cannot hold
+    // shutdown past the service stop timeout) and the parent lookups they start, before
+    // releasing the dependencies' process-level resources (Git worker threads).
     this.disposePromise = (async () => {
-      await Promise.all([this.fileObserver.close(), Promise.allSettled(this.pendingRefreshes)]);
+      await Promise.all([
+        this.fileObserver.close(),
+        this.drainPendingRefreshes(WORKSPACE_GIT_DISPOSE_DRAIN_TIMEOUT_MS),
+      ]);
       await Promise.allSettled(this.pendingForgeWebLookups);
       try {
         await this.deps.disposeDeps?.();
@@ -1218,6 +1225,33 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
     })();
     return this.disposePromise;
+  }
+
+  /**
+   * Wait for in-flight refreshes, but never for longer than the shutdown budget. A refresh that
+   * outlives it is left to the pool teardown, which cancels pooled reads and kills their process
+   * trees. This path never throws: a failed drain must not block the rest of dispose.
+   */
+  private async drainPendingRefreshes(timeoutMs: number): Promise<void> {
+    if (this.pendingRefreshes.size === 0) {
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      Promise.allSettled(this.pendingRefreshes).then(() => true),
+      new Promise<boolean>((settle) => {
+        timer = setTimeout(() => settle(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+    if (!drained) {
+      this.logger.warn(
+        { count: this.pendingRefreshes.size, timeoutMs },
+        "Workspace Git refresh drain exceeded its bound; disposing anyway",
+      );
+    }
   }
 
   private assertNotDisposed(): void {
