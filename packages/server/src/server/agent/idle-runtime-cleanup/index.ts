@@ -82,11 +82,13 @@ export function createIdleRuntimeCleanup(options: Options) {
       if (!runtime.sessionId) continue;
       const family = familyOf(runtime, runtimes);
       try {
-        if (!baselineAllows(family)) {
+        const allowed = baselineAllows(family) && (await providersAllow(family, isCurrent));
+        if (!isCurrent()) break;
+        if (!allowed) {
           protectedAt.set(runtime.identity, { at: timestamp, protected: true });
           options.logger.debug(
             { agentId: runtime.agentId },
-            "Idle runtime retained by a baseline veto",
+            "Idle runtime retained by a baseline or provider veto",
           );
           continue;
         }
@@ -98,17 +100,6 @@ export function createIdleRuntimeCleanup(options: Options) {
           protectedAt.get(runtime.identity)?.at ?? 0,
         );
         if (timestamp - idleSince < IDLE_PERIOD_MS) continue;
-        // A provider probe is a request to the runtime, so only a runtime that is due is asked.
-        const providersAgree = await providersAllow(family, isCurrent);
-        if (!isCurrent()) break;
-        if (!providersAgree) {
-          protectedAt.set(runtime.identity, { at: timestamp, protected: false });
-          options.logger.debug(
-            { agentId: runtime.agentId },
-            "Idle runtime retained by a provider veto",
-          );
-          continue;
-        }
         const revalidate = () => {
           const currentFamily = familyOf(runtime, options.runtimes());
           return (
@@ -133,7 +124,7 @@ export function createIdleRuntimeCleanup(options: Options) {
         }
       } catch (error) {
         if (!isCurrent()) break;
-        protectedAt.set(runtime.identity, { at: timestamp, protected: false });
+        protectedAt.set(runtime.identity, { at: timestamp, protected: true });
         result.failures.push({ agentId: runtime.agentId, error });
         options.logger.warn(
           { agentId: runtime.agentId, err: error },
