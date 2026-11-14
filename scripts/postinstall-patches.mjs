@@ -1,12 +1,74 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 // In CI we often install a single workspace (e.g. server/relay/website). Only apply patches
 // when the patched dependency is actually present.
 // `cwd` is where patch-package must run from. Packages that npm does not hoist to the
 // workspace root live in their workspace's own node_modules, and patch-package resolves
 // the patch's node_modules/... paths relative to its working directory.
+const targetFlag = "--paseo-server-dir";
+const targetArgs = process.argv.slice(2);
+if (targetArgs.length > 0) {
+  if (targetArgs.length !== 2 || targetArgs[0] !== targetFlag || !targetArgs[1]) {
+    console.error(`postinstall-patches: expected only ${targetFlag} <server package directory>`);
+    process.exit(1);
+  }
+  try {
+    applyPaseoServerPatch(resolve(targetArgs[1]));
+  } catch (error) {
+    console.error(`postinstall-patches: ${error.message}`);
+    process.exit(1);
+  }
+  process.exit(0);
+}
+
+function applyPaseoServerPatch(serverDir) {
+  const packageJson = JSON.parse(readFileSync(join(serverDir, "package.json"), "utf8"));
+  if (packageJson.name !== "@getpaseo/server" || packageJson.version !== "0.15.4") {
+    throw new Error("target must be @getpaseo/server 0.15.4");
+  }
+  const targetFile = join(serverDir, "dist/server/server/agent/providers/claude/query.js");
+  const current = readFileSync(targetFile);
+  const digest = createHash("sha256").update(current).digest("hex");
+  const replacement = readFileSync(new URL("../patches/server-0.15.4-query.js", import.meta.url));
+  const replacementDigest = createHash("sha256").update(replacement).digest("hex");
+  if (digest === replacementDigest) return;
+  if (digest !== "c6661cd197b6b95336ffd369d0ee34d9c2a5a02da04a812c4deca9b4a046a248") {
+    throw new Error(`unexpected query.js bytes (${digest})`);
+  }
+
+  const mode = statSync(targetFile).mode & 0o7777;
+  const tempFile = join(
+    serverDir,
+    "dist/server/server/agent/providers/claude",
+    `.query.js.${process.pid}.${randomUUID()}.tmp`,
+  );
+  try {
+    writeFileSync(tempFile, replacement, { flag: "wx", mode });
+    chmodSync(tempFile, mode);
+    renameSync(tempFile, targetFile);
+  } catch (error) {
+    try {
+      unlinkSync(tempFile);
+    } catch {}
+    throw error;
+  }
+}
+
 const patchedPackages = [
   // Backport for expo-modules-core 57.0.23: https://github.com/expo/expo/pull/49634.
   // Remove when the installed Expo SDK includes the Activity recreation fix.

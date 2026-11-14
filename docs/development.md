@@ -557,7 +557,11 @@ runs when its package is actually present, so add the package to that script's `
 list when you introduce a new patch — otherwise the file sits in `patches/` and never applies.
 patch-package cannot apply a patch that changed after an earlier version was applied, so the
 script removes that package and fails the install; the next `npm install` reinstalls it clean
-with the current patch. Regenerate a patch with `npx patch-package <package>` after editing `node_modules/<package>`, and
+with the current patch. The Claude MCP credential backport is a separate, explicit operation: run
+`node scripts/postinstall-patches.mjs --paseo-server-dir <installed @getpaseo/server directory>`.
+It accepts only `@getpaseo/server` 0.15.4 with the recorded original launcher bytes, or the exact
+already-patched launcher, and never removes the target on rejection. Use the installed server
+package directory, not the enclosing CLI package. Regenerate a patch with `npx patch-package <package>` after editing `node_modules/<package>`, and
 patch every build the consumers use: Metro resolves the `react-native` field of a package
 (`src/*.ts` for `react-native-svg`), while Node and Vitest resolve `main`/`module`
 (`lib/commonjs`, `lib/module`). Patching only `lib/` leaves the app bundle unfixed.
