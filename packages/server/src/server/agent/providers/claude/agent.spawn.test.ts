@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
@@ -7,21 +8,13 @@ import type {
   Query,
   SpawnOptions as ClaudeSpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
-import { createTestLogger } from "../../../../test-utils/test-logger.js";
-import * as spawnUtils from "../../../../utils/spawn.js";
-import { ClaudeAgentClient } from "./agent.js";
-import type { ClaudeQueryInput } from "./query.js";
+import { claudeQuery, type ClaudeQueryContext } from "./query.js";
 
-function createQueryMock(events: unknown[]): Query {
-  let index = 0;
+function createQueryMock(): Query {
   return {
-    next: vi.fn(async () =>
-      index < events.length
-        ? { done: false, value: events[index++] }
-        : { done: true, value: undefined },
-    ),
+    next: vi.fn(async () => ({ done: true, value: undefined })),
     return: vi.fn(async () => ({ done: true, value: undefined })),
     interrupt: vi.fn(async () => undefined),
     close: vi.fn(() => undefined),
@@ -37,148 +30,131 @@ function createQueryMock(events: unknown[]): Query {
 }
 
 function createChildProcessStub(): ChildProcess {
-  const child = new EventEmitter() as ChildProcess;
-  child.stderr = new EventEmitter() as ChildProcess["stderr"];
-  return child;
+  return Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+  }) as ChildProcess;
 }
 
-async function createSpawnHarness(): Promise<{
-  spawn: NonNullable<Options["spawnClaudeCodeProcess"]>;
-  close: () => Promise<void>;
-}> {
-  let capturedOptions: Options | undefined;
-  const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
-    capturedOptions = options;
-    return createQueryMock([
-      {
-        type: "system",
-        subtype: "init",
-        session_id: "claude-spawn-regression-session",
-        permissionMode: "default",
-        model: "opus",
-      },
-      { type: "assistant", message: { content: "done" } },
-      {
-        type: "result",
-        subtype: "success",
-        usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
-        total_cost_usd: 0,
-      },
-    ]);
-  });
-  const client = new ClaudeAgentClient({
-    logger: createTestLogger(),
-    queryFactory,
-    resolveBinary: async () => "/test/claude/bin",
-  });
-  const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
-  await session.run("spawn regression");
-  const spawn = capturedOptions?.spawnClaudeCodeProcess;
-  if (!spawn) {
-    await session.close();
-    throw new Error("Claude spawn callback was not configured");
+function getConfigPath(args: string[], occurrence = 0): string {
+  let index = -1;
+  for (let current = 0; current <= occurrence; current += 1) {
+    index = args.indexOf("--mcp-config", index + 1);
+    if (index === -1) throw new Error("MCP config argument is missing");
   }
-  return { spawn, close: () => session.close() };
+  const configPath = args[index + 1];
+  if (!configPath) throw new Error("MCP config path is missing");
+  return configPath;
+}
+
+function createSpawnHarness(spawnProcess: NonNullable<ClaudeQueryContext["spawnProcess"]>): {
+  spawn: NonNullable<Options["spawnClaudeCodeProcess"]>;
+} {
+  let spawn: NonNullable<Options["spawnClaudeCodeProcess"]> | undefined;
+  claudeQuery(
+    { prompt: "", options: {} },
+    {
+      spawnProcess,
+      queryFactory: ({ options }) => {
+        if (!options.spawnClaudeCodeProcess) throw new Error("Claude spawn callback is missing");
+        spawn = options.spawnClaudeCodeProcess;
+        return createQueryMock();
+      },
+    },
+  );
+  if (!spawn) throw new Error("Claude spawn callback was not configured");
+  return { spawn };
 }
 
 describe("Claude spawn override", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  test("keeps inline MCP credentials out of argv and removes config on child exit", async () => {
+  test("keeps every inline MCP credential out of argv and removes its directory on child exit", () => {
     const child = createChildProcessStub();
-    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
-    const harness = await createSpawnHarness();
+    const spawnCalls: Array<{ command: string; args: string[]; shell?: boolean }> = [];
+    const harness = createSpawnHarness((command, args, options) => {
+      spawnCalls.push({ command, args, shell: options?.shell });
+      return child;
+    });
     const credential = "Bearer FAKE_CLAUDE_MCP_TOKEN";
     const firstConfig = JSON.stringify({
       mcpServers: { paseo: { headers: { Authorization: credential } } },
     });
     const secondConfig = JSON.stringify({ mcpServers: { extra: { token: credential } } });
-    const controller = new AbortController();
 
-    try {
-      harness.spawn({
-        command: "node",
-        args: ["claude.js", "--mcp-config", firstConfig, "--mcp-config", secondConfig],
-        cwd: process.cwd(),
-        env: {},
-        signal: controller.signal,
-      } satisfies ClaudeSpawnOptions);
+    harness.spawn({
+      command: "/test/claude/bin",
+      args: ["claude.js", "--mcp-config", firstConfig, "--mcp-config", secondConfig],
+      cwd: process.cwd(),
+      env: {},
+      signal: new AbortController().signal,
+    } satisfies ClaudeSpawnOptions);
 
-      const call = spawnSpy.mock.calls.find(([, args]) => args[0] === "claude.js");
-      expect(call).toBeDefined();
-      const [, args, options] = call!;
-      expect(args).not.toContain(firstConfig);
-      expect(args).not.toContain(secondConfig);
-      expect(args.join(" ")).not.toContain("Authorization");
-      expect(args.join(" ")).not.toContain(credential);
-      expect(args[1]).toBe("--mcp-config");
-      const firstPath = args[2]!;
-      const secondPath = args[4]!;
-      expect(args).toEqual(["claude.js", "--mcp-config", firstPath, "--mcp-config", secondPath]);
-      expect(readFileSync(firstPath, "utf8")).toBe(firstConfig);
-      expect(readFileSync(secondPath, "utf8")).toBe(secondConfig);
-      if (process.platform !== "win32") {
-        expect(statSync(dirname(firstPath)).mode & 0o777).toBe(0o700);
-        expect(statSync(firstPath).mode & 0o777).toBe(0o600);
-      }
-      expect(options?.shell).toBe(false);
-
-      child.emit("exit", 0, null);
-      expect(existsSync(firstPath)).toBe(false);
-      expect(existsSync(secondPath)).toBe(false);
-    } finally {
-      await harness.close();
+    const call = spawnCalls[0];
+    expect(call).toBeDefined();
+    if (!call) throw new Error("Claude process was not spawned");
+    const firstPath = getConfigPath(call.args);
+    const secondPath = getConfigPath(call.args, 1);
+    const configDir = dirname(firstPath);
+    expect(call.command).toBe("/test/claude/bin");
+    expect(call.args).toEqual(["claude.js", "--mcp-config", firstPath, "--mcp-config", secondPath]);
+    expect(call.args.join(" ")).not.toContain("Authorization");
+    expect(call.args.join(" ")).not.toContain(credential);
+    expect(readFileSync(firstPath, "utf8")).toBe(firstConfig);
+    expect(readFileSync(secondPath, "utf8")).toBe(secondConfig);
+    if (process.platform !== "win32") {
+      expect(statSync(configDir).mode & 0o777).toBe(0o700);
+      expect(statSync(firstPath).mode & 0o777).toBe(0o600);
     }
+    expect(call.shell).toBe(false);
+
+    child.emit("exit", 0, null);
+    expect(existsSync(configDir)).toBe(false);
   });
 
-  test("removes the MCP config on abort", async () => {
+  test("removes the MCP config directory on abort", () => {
     const child = createChildProcessStub();
-    const spawnSpy = vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
-    const harness = await createSpawnHarness();
+    const spawnCalls: Array<{ args: string[] }> = [];
+    const harness = createSpawnHarness((_command, args) => {
+      spawnCalls.push({ args });
+      return child;
+    });
     const controller = new AbortController();
 
-    try {
+    harness.spawn({
+      command: "/test/claude/bin",
+      args: ["claude.js", "--mcp-config", JSON.stringify({ mcpServers: {} })],
+      cwd: process.cwd(),
+      env: {},
+      signal: controller.signal,
+    } satisfies ClaudeSpawnOptions);
+    const call = spawnCalls[0];
+    expect(call).toBeDefined();
+    if (!call) throw new Error("Claude process was not spawned");
+    const configDir = dirname(getConfigPath(call.args));
+    expect(existsSync(configDir)).toBe(true);
+
+    controller.abort();
+    expect(existsSync(configDir)).toBe(false);
+  });
+
+  test("removes the MCP config directory on spawn failure without masking the error", () => {
+    let configDir: string | undefined;
+    const harness = createSpawnHarness((_command, args) => {
+      configDir = dirname(getConfigPath(args));
+      throw new Error("synthetic spawn failure");
+    });
+
+    expect(() =>
       harness.spawn({
-        command: "node",
+        command: "/test/claude/bin",
         args: ["claude.js", "--mcp-config", JSON.stringify({ mcpServers: {} })],
         cwd: process.cwd(),
         env: {},
-        signal: controller.signal,
-      });
-      const args = spawnSpy.mock.calls[0]![1];
-      const configPath = args[args.indexOf("--mcp-config") + 1]!;
-      expect(existsSync(configPath)).toBe(true);
-      controller.abort();
-      expect(existsSync(configPath)).toBe(false);
-    } finally {
-      await harness.close();
-    }
-  });
-
-  test("removes the MCP config on spawn failure without masking the error", async () => {
-    let configPath: string | undefined;
-    vi.spyOn(spawnUtils, "spawnProcess").mockImplementation((_command, args) => {
-      configPath = args[args.indexOf("--mcp-config") + 1];
-      throw new Error("synthetic spawn failure");
-    });
-    const harness = await createSpawnHarness();
-
-    try {
-      expect(() =>
-        harness.spawn({
-          command: "node",
-          args: ["claude.js", "--mcp-config", JSON.stringify({ mcpServers: {} })],
-          cwd: process.cwd(),
-          env: {},
-          signal: new AbortController().signal,
-        }),
-      ).toThrow("synthetic spawn failure");
-      expect(configPath).toBeDefined();
-      expect(existsSync(configPath!)).toBe(false);
-    } finally {
-      await harness.close();
-    }
+        signal: new AbortController().signal,
+      } satisfies ClaudeSpawnOptions),
+    ).toThrow("synthetic spawn failure");
+    expect(configDir).toBeDefined();
+    if (!configDir) throw new Error("MCP config directory was not created");
+    expect(existsSync(configDir)).toBe(false);
   });
 });
