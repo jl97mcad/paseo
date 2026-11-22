@@ -313,6 +313,8 @@ export class ProviderSubagentCompletionStore {
         outcome: input.outcome,
         provenance: "consumer-verification",
       });
+      if (Buffer.byteLength(JSON.stringify(entry)) > 64 * 1024)
+        throw new Error("Verification exceeds 64 KiB");
       await this.save({
         ...journal,
         nextSequence: entry.sequence + 1,

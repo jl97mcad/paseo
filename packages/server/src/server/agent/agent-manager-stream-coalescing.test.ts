@@ -1728,7 +1728,9 @@ test("replays a silent provider subagent completion after manager restart", asyn
     },
   ]);
   expect(journal).toHaveLength(2);
-  expect(await completions.replay(agentId)).toHaveLength(0);
+  for (const event of journal)
+    await completions.acknowledge(agentId, event.sequence, "test-consumer");
+  expect(await completions.replay(agentId, "test-consumer")).toHaveLength(0);
   await expect(completions.acknowledge(agentId, 99)).rejects.toThrow(
     "Cannot acknowledge unknown completion",
   );
@@ -1743,7 +1745,9 @@ test("replays a silent provider subagent completion after manager restart", asyn
   };
   await completions.append(agentId, "codex", crashEvent);
   await completions.append(agentId, "codex", crashEvent);
-  expect(await completions.replay(agentId)).toMatchObject([{ helperId: "helper-3" }]);
+  expect(await completions.replay(agentId, "test-consumer")).toMatchObject([
+    { helperId: "helper-3" },
+  ]);
   // Model a crash after the durable append and before projection/ack.
   const restartedStorage = new AgentStorage(join(root, "agents"), logger);
   const restarted = new AgentManager({
@@ -2052,6 +2056,16 @@ test("retention reports replay gaps and never reuses delivery sequences", async 
     await restarted.append("parent", "codex", { type: "upsert", id: "next", status: "completed" }),
   ).toMatchObject({ sequence: 4 });
   expect(await restarted.readAll("parent")).toHaveLength(2);
+  const large = await restarted.append("parent", "codex", {
+    type: "upsert",
+    id: "large",
+    status: "completed",
+    role: "x".repeat(60_000),
+  });
+  if (!large) throw new Error("missing observation");
+  await expect(
+    restarted.verify("parent", large.sequence, { outcome: "unknown", evidence: "x".repeat(8192) }),
+  ).rejects.toThrow("Verification exceeds 64 KiB");
 });
 
 test("apply before ack failure redelivers and rebuilds the projection", async () => {
@@ -2059,9 +2073,9 @@ test("apply before ack failure redelivers and rebuilds the projection", async ()
   const logger = createTestLogger();
   const client = new TestAgentClient();
   const storage = new AgentStorage(join(root, "agents"), logger);
-  let writes = 0;
+  let failAck = false;
   const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
-    if (++writes === 2) throw new Error("simulated crash before ack persistence");
+    if (failAck) throw new Error("simulated crash before ack persistence");
     await writeJsonFileAtomic(file, data);
   });
   const manager = new AgentManager({
@@ -2083,8 +2097,13 @@ test("apply before ack failure redelivers and rebuilds the projection", async ()
   expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
     { id: "helper", status: "completed" },
   ]);
+  failAck = true;
+  await expect(store.acknowledge(AGENT_IDS[0], 1, "automation")).rejects.toThrow("simulated crash");
+  failAck = false;
   const recoveredStore = new ProviderSubagentCompletionStore(root);
-  expect(await recoveredStore.replay(AGENT_IDS[0])).toMatchObject([{ helperId: "helper" }]);
+  expect(await recoveredStore.replay(AGENT_IDS[0], "automation")).toMatchObject([
+    { helperId: "helper" },
+  ]);
   await manager.closeAgent(AGENT_IDS[0]);
   await manager.flush();
   await storage.flush();
@@ -2103,7 +2122,8 @@ test("apply before ack failure redelivers and rebuilds the projection", async ()
   expect(recovered.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
     { id: "helper", status: "completed" },
   ]);
-  expect(await recoveredStore.replay(AGENT_IDS[0])).toHaveLength(0);
+  await recoveredStore.acknowledge(AGENT_IDS[0], 1, "automation");
+  expect(await recoveredStore.replay(AGENT_IDS[0], "automation")).toHaveLength(0);
   await recovered.closeAgent(AGENT_IDS[0]);
   await recovered.flush();
   await recoveredStorage.flush();
@@ -2134,4 +2154,32 @@ test("Codex preserves native terminal identity separately from normalized routin
     await session.close();
     appServer.disconnect();
   }
+});
+
+test("external consumer capacity cannot block lifecycle recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-capacity-"));
+  const logger = createTestLogger();
+  const client = new TestAgentClient();
+  const store = new ProviderSubagentCompletionStore(root);
+  await store.append(AGENT_IDS[0], "codex", {
+    type: "upsert",
+    id: "helper",
+    status: "completed",
+    sourceEventId: "native-1",
+  });
+  for (let index = 0; index < 256; index++) await store.consume(AGENT_IDS[0], `consumer-${index}`);
+  await expect(store.consume(AGENT_IDS[0], "overflow")).rejects.toThrow("consumer limit");
+  const manager = new AgentManager({
+    clients: { codex: client },
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+  });
+  expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+    { id: "helper", status: "completed" },
+  ]);
+  await manager.closeAgent(AGENT_IDS[0]);
+  await manager.flush();
 });

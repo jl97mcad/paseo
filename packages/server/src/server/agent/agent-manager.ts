@@ -1508,7 +1508,6 @@ export class AgentManager {
         ...(completion.sourceEventTime ? { timestamp: completion.sourceEventTime } : {}),
       });
       this.dispatch({ type: "provider_subagent", event: update });
-      await store.acknowledge(parentAgentId, completion.sequence);
     }
   }
 
@@ -5016,8 +5015,6 @@ export class AgentManager {
           : event.event,
       );
       this.dispatch({ type: "provider_subagent", event: update });
-      if (completion)
-        await this.providerSubagentCompletionStore?.acknowledge(agent.id, completion.sequence);
       return;
     }
     if (event.type === "background_work") {

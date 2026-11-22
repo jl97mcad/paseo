@@ -2180,7 +2180,10 @@ function createToolCatalog(
     .string()
     .min(1)
     .max(128)
-    .refine((name) => name !== "projection", "projection is reserved for daemon delivery");
+    .refine(
+      (name) => name !== "projection",
+      "projection is reserved for legacy acknowledgement state",
+    );
   registerTool(
     "helper_completions",
     {
