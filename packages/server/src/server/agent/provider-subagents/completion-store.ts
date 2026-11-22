@@ -42,11 +42,17 @@ const journalSchema = z.object({
 });
 type Journal = z.infer<typeof journalSchema>;
 
+interface FailedAppends {
+  gaps: string[];
+  omitted: number;
+}
+
 /** Single daemon writer. Consumers call the daemon API, never open this file independently. */
 export class ProviderSubagentCompletionStore {
   private journal: Journal | undefined;
   private pending: Promise<unknown> = Promise.resolve();
-  private readonly failedAppends = new Map<string, string[]>();
+  private readonly failedAppends = new Map<string, FailedAppends>();
+  private failureTrackingOverflowed = false;
   private readonly file: string;
 
   constructor(
@@ -151,7 +157,7 @@ export class ProviderSubagentCompletionStore {
         provenance,
         outcome,
         gaps: [
-          ...(this.failedAppends.get(parentAgentId) ?? []),
+          ...this.failedObservationGaps(parentAgentId),
           ...missing,
           ...(!identity ? ["deduplication identity unavailable"] : []),
           ...(outcome === "unknown" ? ["terminal outcome unavailable"] : []),
@@ -170,10 +176,39 @@ export class ProviderSubagentCompletionStore {
     });
   }
 
+  private failedObservationGaps(parentAgentId: string): string[] {
+    const failures = this.failedAppends.get(parentAgentId);
+    const failureGaps = [...(failures?.gaps ?? [])];
+    if (failures?.omitted) {
+      const count =
+        failures.omitted === Number.MAX_SAFE_INTEGER
+          ? `at least ${failures.omitted}`
+          : `${failures.omitted}`;
+      failureGaps.push(`${count} further observations not durably accepted`);
+    }
+    if (this.failureTrackingOverflowed)
+      failureGaps.push(
+        "failure tracking overflow: failed observations for evicted parents may be missing",
+      );
+    return failureGaps;
+  }
+
   recordFailedAppend(parentAgentId: string, helperId: string, provenance: string): void {
-    const gaps = this.failedAppends.get(parentAgentId) ?? [];
-    gaps.push(`observation not durably accepted: ${helperId} (${provenance})`);
-    this.failedAppends.set(parentAgentId, gaps);
+    const failures = this.failedAppends.get(parentAgentId) ?? { gaps: [], omitted: 0 };
+    const detail = `observation not durably accepted: ${helperId} (${provenance})`;
+    // Bound serialized gaps too: JSON escaping can expand each code unit to six bytes.
+    failures.gaps.push(detail.length > 256 ? `${detail.slice(0, 256)} [truncated]` : detail);
+    if (failures.gaps.length > 16) {
+      failures.gaps.shift();
+      failures.omitted = Math.min(failures.omitted + 1, Number.MAX_SAFE_INTEGER);
+    }
+    this.failedAppends.delete(parentAgentId);
+    this.failedAppends.set(parentAgentId, failures);
+    if (this.failedAppends.size > 256) {
+      const oldest = this.failedAppends.keys().next().value;
+      if (oldest !== undefined) this.failedAppends.delete(oldest);
+      this.failureTrackingOverflowed = true;
+    }
   }
 
   readAll(parentAgentId: string): Promise<ProviderSubagentCompletion[]> {

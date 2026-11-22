@@ -2060,6 +2060,144 @@ test("provider subagent projection survives a failed journal append", async () =
   await manager.flush();
 });
 
+test("many failed observations stay bounded and allow durable recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-failure-bound-"));
+  let fail = true;
+  const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+    if (fail) throw new Error("journal unavailable");
+    await writeJsonFileAtomic(file, data);
+  });
+  for (let index = 0; index < 1000; index++) {
+    const id = `helper-${index}`;
+    await expect(
+      store.append("parent", "codex", { type: "upsert", id, status: "completed" }),
+    ).rejects.toThrow("journal unavailable");
+    store.recordFailedAppend("parent", id, "provider-stream");
+  }
+  fail = false;
+  await store.append("parent", "codex", { type: "upsert", id: "recovered", status: "completed" });
+  const [recovered] = await new ProviderSubagentCompletionStore(root).replay(
+    "parent",
+    "automation",
+  );
+  expect(recovered.helperId).toBe("recovered");
+  expect(recovered.gaps).toContain("984 further observations not durably accepted");
+  expect(recovered.gaps).toContain(
+    "observation not durably accepted: helper-999 (provider-stream)",
+  );
+  expect(
+    recovered.gaps.filter((gap) => gap.startsWith("observation not durably accepted:")),
+  ).toHaveLength(16);
+  expect(recovered.gaps.join("")).not.toContain("helper-0 (");
+  expect(Buffer.byteLength(JSON.stringify(recovered))).toBeLessThan(64 * 1024);
+  await store.append("parent", "codex", { type: "upsert", id: "next", status: "completed" });
+  expect((await store.readAll("parent"))[1].gaps).not.toContain(
+    "984 further observations not durably accepted",
+  );
+});
+
+test("failure detail and parent overflow remain visible without blocking appends", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-failure-overflow-"));
+  const store = new ProviderSubagentCompletionStore(root);
+  for (let index = 0; index < 257; index++) {
+    store.recordFailedAppend(`parent-${index}`, `helper-${index}`, "provider-stream");
+  }
+  for (let index = 0; index < 16; index++) {
+    store.recordFailedAppend("parent-256", "\u0000".repeat(10_000), "provider-stream");
+  }
+  await store.append("parent-256", "codex", {
+    type: "upsert",
+    id: "recovered",
+    status: "completed",
+  });
+  await store.append("parent-0", "codex", { type: "upsert", id: "evicted", status: "completed" });
+  const restarted = new ProviderSubagentCompletionStore(root);
+  const [recovered] = await restarted.replay("parent-256", "automation");
+  const overflow =
+    "failure tracking overflow: failed observations for evicted parents may be missing";
+  expect(recovered.gaps).toContain(overflow);
+  expect(recovered.gaps).toContain("1 further observations not durably accepted");
+  const details = recovered.gaps.filter((gap) =>
+    gap.startsWith("observation not durably accepted:"),
+  );
+  expect(details).toHaveLength(16);
+  expect(details.every((gap) => gap.endsWith(" [truncated]"))).toBe(true);
+  expect(Buffer.byteLength(JSON.stringify(recovered))).toBeLessThan(32 * 1024);
+  const [evicted] = await restarted.replay("parent-0", "automation");
+  expect(evicted.gaps).toContain(overflow);
+  expect(evicted.gaps).not.toContain(
+    "observation not durably accepted: helper-0 (provider-stream)",
+  );
+});
+
+test.each(["turn-end", "close", "reload"])(
+  "running helper observation append failure preserves %s and is replayed as a later gap",
+  async (action) => {
+    const root = mkdtempSync(join(tmpdir(), "running-helper-append-failure-"));
+    const logs: string[] = [];
+    const logger = pino({ level: "error" }, { write: (line) => logs.push(line) });
+    const client = new TestAgentClient();
+    let fail = true;
+    const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+      if (fail) throw new Error("journal unavailable");
+      await writeJsonFileAtomic(file, data);
+    });
+    const manager = new AgentManager({
+      clients: { codex: client },
+      registry: new AgentStorage(join(root, "agents"), logger),
+      providerSubagentCompletionStore: store,
+      logger,
+    });
+    try {
+      await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+        workspaceId: undefined,
+      });
+      const session = client.getSession(root);
+      session.pushEvent({ type: "turn_started", provider: "codex", turnId: "parent-turn" });
+      session.pushEvent({
+        type: "provider_subagent",
+        provider: "codex",
+        event: { type: "upsert", id: "running-helper", status: "running" },
+      });
+      await waitForSessionEventQueue();
+      if (action === "turn-end") {
+        session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "parent-turn" });
+        await waitForSessionEventQueue();
+        expect(manager.getAgent(AGENT_IDS[0])?.lifecycle).toBe("idle");
+      } else if (action === "close") {
+        await manager.closeAgent(AGENT_IDS[0]);
+        expect(manager.getAgent(AGENT_IDS[0])).toBeNull();
+      } else {
+        await manager.reloadAgentSession(AGENT_IDS[0]);
+        expect(manager.getAgent(AGENT_IDS[0])?.lifecycle).toBe("idle");
+      }
+      expect(logs.join("")).toContain("Helper observation not durably accepted");
+      expect(logs.join("")).toContain("running-helper");
+      expect(await store.readAll(AGENT_IDS[0])).toEqual([]);
+      fail = false;
+      await store.append(AGENT_IDS[0], "codex", {
+        type: "upsert",
+        id: "later",
+        status: "completed",
+      });
+      expect(
+        await new ProviderSubagentCompletionStore(root).replay(AGENT_IDS[0], "automation"),
+      ).toMatchObject([
+        {
+          helperId: "later",
+          gaps: expect.arrayContaining([
+            "observation not durably accepted: running-helper (daemon-observation)",
+          ]),
+        },
+      ]);
+    } finally {
+      fail = false;
+      await manager.closeAgent(AGENT_IDS[0]);
+      await manager.flush();
+    }
+  },
+);
+
 test("MCP consumers replay and ack independently across daemon reload", async () => {
   const root = mkdtempSync(join(tmpdir(), "completion-api-"));
   const logger = createTestLogger();
