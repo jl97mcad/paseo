@@ -4239,6 +4239,209 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test.each([
+    ["exec command", "codex/event/exec_command_begin", null],
+    ["late reasoning", "item/reasoning/summaryTextDelta", null],
+    [
+      "late tool",
+      "item/started",
+      { type: "commandExecution", id: "late-command", command: "pwd", status: "inProgress" },
+    ],
+    [
+      "running tool",
+      "item/started",
+      { type: "commandExecution", id: "command-b", command: "pwd", status: "inProgress" },
+    ],
+    ["completed item", "item/completed", { type: "agentMessage", id: "message-b", text: "Done" }],
+    ["compaction", "item/started", { type: "contextCompaction", id: "compact-b" }],
+    ["completed compaction", "item/completed", { type: "contextCompaction", id: "compact-b" }],
+    ["reasoning", "item/reasoning/summaryTextDelta", null],
+    ["message", "item/agentMessage/delta", null],
+    [
+      "user message",
+      "item/started",
+      { type: "userMessage", id: "user-b", content: [{ type: "inputText", text: "Continue" }] },
+    ],
+    [
+      "legacy activity",
+      "item/completed",
+      { type: "subAgentActivity", id: "activity-b", agentThreadId: "child-b", kind: "interacted" },
+    ],
+    [
+      "control",
+      "item/completed",
+      {
+        type: "collabAgentToolCall",
+        id: "wait-b",
+        tool: "wait",
+        status: "completed",
+        receiverThreadIds: ["child-b"],
+        agentsStates: { "child-b": { status: "completed", message: null } },
+      },
+    ],
+  ])("keeps sibling terminal evidence after %s", async (_name, method, item) => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await asInternals(session).handleNotification("item/started", {
+      threadId: "test-thread",
+      item: {
+        type: "collabAgentToolCall",
+        id: "siblings",
+        tool: "spawnAgent",
+        status: "inProgress",
+        receiverThreadIds: ["child-a", "child-b"],
+        prompt: "Work",
+      },
+    });
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-a",
+      turn: { id: "failed-a", status: "failed" },
+    });
+    events.length = 0;
+    let threadId = "child-b";
+    if (_name.startsWith("late")) threadId = "child-a";
+    else if (_name === "legacy activity" || _name === "control") threadId = "test-thread";
+    await asInternals(session).handleNotification(method, {
+      threadId,
+      msg: { type: "exec_command_begin", threadId: "child-b", call_id: "exec-b", command: "pwd" },
+      item,
+      itemId: "delta-b",
+      delta: "Working",
+      contentIndex: 0,
+    });
+    if (!_name.startsWith("late"))
+      expect(
+        events.some(
+          (event) =>
+            event.type === "provider_subagent" &&
+            event.event.type === "upsert" &&
+            event.event.id === "child-b",
+        ),
+      ).toBe(true);
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "provider_subagent" &&
+          event.event.type === "upsert" &&
+          event.event.id === "child-a",
+      ),
+    ).toEqual([]);
+    await session.close();
+  });
+
+  test.each([
+    ["completed", "completed", "completed"],
+    ["interrupted", "interrupted", "canceled"],
+    ["completed", "interrupted", "canceled"],
+    ["failed", "completed", "failed"],
+  ])("settles sibling card for %s and %s", async (first, second, expected) => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await asInternals(session).handleNotification("item/started", {
+      threadId: "test-thread",
+      item: {
+        type: "collabAgentToolCall",
+        id: "siblings",
+        tool: "spawnAgent",
+        status: "inProgress",
+        receiverThreadIds: ["child-a", "child-b"],
+        prompt: "Work",
+      },
+    });
+    events.length = 0;
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-a",
+      turn: { id: "first-a", status: first },
+    });
+    expect(events.filter((event) => event.type === "timeline")).toEqual([]);
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-b",
+      turn: { id: "first-b", status: second },
+    });
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: expected },
+    });
+    events.length = 0;
+    await asInternals(session).handleNotification("turn/started", {
+      threadId: "child-b",
+      turn: { id: "second-b", status: "inProgress" },
+    });
+    expect(
+      events.filter((event) => event.type === "provider_subagent" && event.event.type === "upsert"),
+    ).toEqual([
+      expect.objectContaining({
+        event: expect.objectContaining({ id: "child-b", status: "running" }),
+      }),
+    ]);
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: "running" },
+    });
+    events.length = 0;
+    await asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "child-b",
+      itemId: "reopened-b",
+      delta: "Working",
+    });
+    expect(events.filter((event) => event.type === "timeline")).toEqual([]);
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-b",
+      turn: { id: "second-b", status: second },
+    });
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: expected },
+    });
+    await session.close();
+  });
+
+  test("keeps sibling evidence when another child is registered after settlement", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const spawn = (receiverThreadIds: string[]) =>
+      asInternals(session).handleNotification("item/started", {
+        threadId: "test-thread",
+        item: {
+          type: "collabAgentToolCall",
+          id: "late-siblings",
+          tool: "spawnAgent",
+          status: "inProgress",
+          receiverThreadIds,
+          prompt: "Work",
+        },
+      });
+    await spawn(["child-a"]);
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-a",
+      turn: { id: "first-a", status: "failed" },
+    });
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: "failed" },
+    });
+    events.length = 0;
+    await spawn(["child-a", "child-b"]);
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: "running" },
+    });
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "provider_subagent" &&
+          event.event.type === "upsert" &&
+          event.event.id === "child-a",
+      ),
+    ).toEqual([expect.objectContaining({ event: expect.objectContaining({ status: "failed" }) })]);
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-b",
+      turn: { id: "first-b", status: "completed" },
+    });
+    expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
+      item: { status: "failed" },
+    });
+    await session.close();
+  });
+
   test("keeps sibling terminal evidence on the reporting child", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];
