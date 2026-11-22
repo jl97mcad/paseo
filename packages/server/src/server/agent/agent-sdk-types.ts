@@ -898,10 +898,6 @@ export interface AgentClient {
   resolveCreateConfig?(input: ResolveAgentCreateConfigInput): ResolveAgentCreateConfigResult;
   isCreateConfigUnattended?(input: AgentCreateConfigUnattendedInput): boolean;
   listCommands?(config: AgentSessionConfig): Promise<AgentSlashCommand[]>;
-  listCommandsWithoutSession?(
-    config: AgentSessionConfig,
-    context?: AgentLaunchContext,
-  ): Promise<AgentSlashCommand[]>;
   /**
    * The controls of a draft, with the options a session opened from `config` would run with:
    * `config.providerOptions` (defaults already merged in) plus what the provider resolves

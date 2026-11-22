@@ -577,17 +577,6 @@ function wrapClientProvider(
     resolveConfiguredModel: inner.resolveConfiguredModel?.bind(inner),
     isCreateConfigUnattended: inner.isCreateConfigUnattended?.bind(inner),
     effectiveOptions: (own) => withDefaults(own) ?? {},
-    listCommandsWithoutSession: inner.listCommandsWithoutSession
-      ? (config, context) =>
-          inner.listCommandsWithoutSession!(
-            {
-              ...config,
-              provider: inner.provider,
-              providerOptions: withDefaults(config.providerOptions),
-            },
-            context,
-          )
-      : undefined,
     listControls: listControls
       ? async (config) =>
           await listControls({

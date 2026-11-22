@@ -726,7 +726,6 @@ function createReopenableCodexAgent(
     isAvailable: async () => true,
     fetchCatalog: async () => ({ models: [], modes: [] }),
     createSession: (...args) => provider.createSession(...args),
-    listCommandsWithoutSession: (...args) => provider.listCommandsWithoutSession(...args),
     resumeSession: (...args) => provider.resumeSession(...args),
   };
   const manager = new AgentManager({
@@ -907,8 +906,31 @@ test("a prompt admitted during the idle probe prevents collection", async () => 
   }
 }, 30_000);
 
-test("listing commands for a closed Codex agent does not reopen its runtime", async () => {
-  const codex = createReopenableCodexAgent({});
+test("listing commands for a closed Codex agent uses the configured skill inventory", async () => {
+  const codex = createReopenableCodexAgent({}, undefined, {
+    "skills/list": () => ({
+      data: [
+        {
+          cwd: process.cwd(),
+          skills: [
+            {
+              name: "configured-skill",
+              description: "Configured skill",
+              path: "/configured/SKILL.md",
+              enabled: true,
+            },
+            {
+              name: "disabled-skill",
+              description: "Disabled skill",
+              path: "/disabled/SKILL.md",
+              enabled: false,
+            },
+          ],
+          errors: [],
+        },
+      ],
+    }),
+  });
   const ctx = await createDaemonTestContext({ agentClients: { codex: codex.client } });
   try {
     const agent = await ctx.client.createAgent({ provider: "codex", cwd: process.cwd() });
@@ -917,8 +939,8 @@ test("listing commands for a closed Codex agent does not reopen its runtime", as
     const response = await ctx.client.listCommands({ agentId: agent.id });
     expect(response.error).toBeNull();
     expect(response.commands.map((command) => command.name)).toContain("compact");
-    expect(codex.appServers).toHaveLength(1);
-    expect(ctx.daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+    expect(response.commands.map((command) => command.name)).toContain("configured-skill");
+    expect(response.commands.map((command) => command.name)).not.toContain("disabled-skill");
   } finally {
     await ctx.cleanup();
   }
@@ -952,13 +974,6 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
     await ctx.cleanup();
     const count = codex.appServers.length;
     ctx = await createDaemonTestContext(options);
-    expect(codex.appServers).toHaveLength(count);
-    for (const agentId of ids) {
-      const response = await ctx.client.listCommands({ agentId });
-      expect(response.error).toBeNull();
-      expect(response.commands.map((command) => command.name)).toContain("compact");
-      expect(ctx.daemon.daemon.agentManager.getAgent(agentId)).toBeNull();
-    }
     expect(codex.appServers).toHaveLength(count);
     const sent = ctx.client.sendMessage(ids[0], "Continue the saved conversation");
     await expect.poll(() => codex.appServers.length).toBe(count + 1);

@@ -8110,21 +8110,6 @@ export class CodexAppServerAgentClient implements AgentClient {
     private readonly deps: CodexAppServerAgentDeps = {},
   ) {}
 
-  async listCommandsWithoutSession(
-    config: AgentSessionConfig,
-    context?: AgentLaunchContext,
-  ): Promise<AgentSlashCommand[]> {
-    const codexHome = resolveCodexHomeDir(
-      buildCodexAppServerEnv(this.runtimeSettings, context?.env),
-    );
-    const [goalsEnabled, skills, prompts] = await Promise.all([
-      this.resolveGoalsEnabled(),
-      listCodexSkills(config.cwd, codexHome, this.deps.workspaceGitService),
-      listCodexCustomPrompts(codexHome),
-    ]);
-    return codexCommands(goalsEnabled, [...skills, ...prompts]);
-  }
-
   private async readInstalledCodex(signal: AbortSignal): Promise<InstalledCodex> {
     const installed = await this.resolveInstalledCommand();
     if (!installed) return { status: "not_installed" };

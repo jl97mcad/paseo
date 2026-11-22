@@ -1329,14 +1329,6 @@ export class AgentManager {
     }
   }
 
-  async listClosedAgentCommands(record: StoredAgentRecord): Promise<AgentSlashCommand[] | null> {
-    const client = this.clients.get(record.provider);
-    if (!client?.listCommandsWithoutSession) return null;
-    const config = buildSessionConfig(record, { validProviders: this.getRegisteredProviderIds() });
-    if (!config) return null;
-    return client.listCommandsWithoutSession(config, { env: record.launchEnv });
-  }
-
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
     const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
     const client = this.requireClient(normalizedConfig.provider);
