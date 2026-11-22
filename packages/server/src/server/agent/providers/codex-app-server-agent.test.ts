@@ -1009,6 +1009,7 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
       await ctx.client.fetchAgentTimeline(agentId);
       expect(codex.liveServers.size).toBe(0);
     }
+    expect(codex.appServers).toHaveLength(count);
     codex.resetPeak();
     const listings = await Promise.all(ids.map((agentId) => ctx.client.listCommands({ agentId })));
     for (const commands of listings) {
@@ -1016,7 +1017,8 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
       expect(commands.commands.map((command) => command.name)).toContain("compact");
     }
     expect(codex.liveServers.size).toBe(0);
-    expect(codex.peak()).toBe(1);
+    expect(codex.appServers).toHaveLength(count);
+    expect(codex.peak()).toBe(0);
     const beforePrompt = codex.appServers.length;
     const sent = ctx.client.sendMessage(ids[0], "Continue the saved conversation");
     await expect.poll(() => codex.appServers.length).toBe(beforePrompt + 1);
