@@ -3735,7 +3735,7 @@ interface CodexSubAgentCallState {
   pendingCommandOutputDeltas: Map<string, string[]>;
   pendingFileChangeOutputDeltas: Map<string, string[]>;
   childThreadIds: Set<string>;
-  childStatuses: Map<string, ToolCallTimelineItem["status"]>;
+  childStatuses: Map<string, { status: ToolCallTimelineItem["status"]; nativeTurnId?: string }>;
 }
 
 function resolveCodexParentSubagentId(
@@ -6434,6 +6434,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     parentCallId: string | null;
     parentSubagentId: string | null;
     deferUpsert?: boolean;
+    emitCard?: boolean;
   }): string[] {
     const { timelineItem, rawItem, parentCallId, parentSubagentId } = params;
     if (timelineItem.detail.type !== "sub_agent") {
@@ -6452,7 +6453,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         pendingCommandOutputDeltas: new Map<string, string[]>(),
         pendingFileChangeOutputDeltas: new Map<string, string[]>(),
         childThreadIds: new Set<string>(),
-        childStatuses: new Map<string, ToolCallTimelineItem["status"]>(),
+        childStatuses: new Map(),
       } satisfies CodexSubAgentCallState);
 
     const previousToolCall = state.toolCall;
@@ -6475,16 +6476,46 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       this.subAgentCallIdByChildThreadId.set(receiverThreadId, timelineItem.callId);
       state.childThreadIds.add(receiverThreadId);
-      if (!params.deferUpsert) {
-        const status = state.childStatuses.get(receiverThreadId) ?? timelineItem.status;
-        this.emitProviderSubagentUpsert(receiverThreadId, state, status);
-      }
+      this.registerSubAgentChild(
+        state,
+        receiverThreadId,
+        rawItem,
+        timelineItem,
+        params.deferUpsert,
+      );
     }
-    if (existing && !params.deferUpsert) {
+    if (existing && !params.deferUpsert && params.emitCard !== false) {
       const changed = !isDeepStrictEqual(previousToolCall, state.toolCall);
       this.emitSubAgentCardIfChanged(state, state.callId, state.toolCall, changed);
     }
     return childThreadIds;
+  }
+
+  private registerSubAgentChild(
+    state: CodexSubAgentCallState,
+    receiverThreadId: string,
+    rawItem: { [key: string]: unknown },
+    timelineItem: ToolCallTimelineItem,
+    deferUpsert?: boolean,
+  ): void {
+    const previous = state.childStatuses.get(receiverThreadId);
+    const snapshot = toObjectRecord(toObjectRecord(rawItem.agentsStates)?.[receiverThreadId]);
+    const snapshotStatus =
+      typeof snapshot?.status === "string"
+        ? normalizeCollabAgentChildStatus(snapshot.status, "spawnAgent")
+        : timelineItem.status;
+    if (!previous || !isTerminalSubAgentStatus(previous.status)) {
+      if (isTerminalSubAgentStatus(snapshotStatus)) {
+        state.childStatuses.set(receiverThreadId, { status: snapshotStatus });
+      }
+    }
+    if (!deferUpsert && !isTerminalSubAgentStatus(previous?.status ?? "running")) {
+      this.emitProviderSubagentUpsert(
+        receiverThreadId,
+        state,
+        state.childStatuses.get(receiverThreadId)?.status ?? timelineItem.status,
+      );
+    }
   }
 
   private handleRegisteredCollabAgentControl(
@@ -6498,7 +6529,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       const state = this.subAgentCallsByCallId.get(callId);
       if (!state) continue;
       const previous =
-        state.childStatuses.get(update.threadId) ??
+        state.childStatuses.get(update.threadId)?.status ??
         (state.childThreadIds.size === 1 ? state.toolCall.status : "running");
       const status = resolveCodexCollabAgentUpdate(previous, update);
       if (status !== previous) {
@@ -6691,8 +6722,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     state.toolCall = nextToolCall;
     if (!scopedChildThreadId) {
       for (const childThreadId of state.childThreadIds) {
-        const previous = state.childStatuses.get(childThreadId);
-        if (isTerminalSubAgentStatus(previous ?? "running")) continue;
+        if (this.isSettledSubAgentChild(state, childThreadId)) continue;
         this.emitProviderSubagentUpsert(
           childThreadId,
           state,
@@ -6702,6 +6732,10 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
     }
     this.emitSubAgentCardIfChanged(state, callId, nextToolCall, cardChanged);
+  }
+
+  private isSettledSubAgentChild(state: CodexSubAgentCallState, id: string): boolean {
+    return isTerminalSubAgentStatus(state.childStatuses.get(id)?.status ?? "running");
   }
 
   private emitSubAgentCardIfChanged(
@@ -6723,32 +6757,59 @@ export class CodexAppServerAgentSession implements AgentSession {
     const childThreadId = options?.childThreadId;
     if (!childThreadId) return null;
     const previousStatus =
-      state.childStatuses.get(childThreadId) ??
+      state.childStatuses.get(childThreadId)?.status ??
       (state.childThreadIds.size === 1 ? state.toolCall.status : "running");
     if (
-      status === "running" &&
-      previousStatus &&
       isTerminalSubAgentStatus(previousStatus) &&
-      !options?.reopen
+      !options?.reopen &&
+      (!status || !isTerminalSubAgentStatus(status) || !options?.nativeTurnId)
     ) {
+      return null;
+    }
+    if (this.isRepeatedSubAgentTerminal(state, childThreadId, status, options?.nativeTurnId)) {
       return null;
     }
     const resolvedStatus = status ?? previousStatus;
     // Only a native lifecycle start may replace terminal evidence with running.
-    state.childStatuses.set(childThreadId, resolvedStatus);
+    state.childStatuses.set(childThreadId, {
+      status: resolvedStatus,
+      nativeTurnId: options?.nativeTurnId,
+    });
     this.emitProviderSubagentUpsert(childThreadId, state, resolvedStatus, options?.nativeTurnId);
+    return this.resolveSubAgentCardStatus(state);
+  }
+
+  private isRepeatedSubAgentTerminal(
+    state: CodexSubAgentCallState,
+    childThreadId: string,
+    status: ToolCallTimelineItem["status"] | undefined,
+    nativeTurnId: string | undefined,
+  ): boolean {
+    const previous = state.childStatuses.get(childThreadId);
+    return (
+      !!status &&
+      isTerminalSubAgentStatus(status) &&
+      !!nativeTurnId &&
+      previous?.status === status &&
+      previous.nativeTurnId === nativeTurnId
+    );
+  }
+
+  private resolveSubAgentCardStatus(state: CodexSubAgentCallState): ToolCallTimelineItem["status"] {
     // Settle only the registered children. A later registration can reopen the card;
     // activity cannot establish a terminal outcome for a child Codex never reports.
     if (
       ![...state.childThreadIds].every((id) => {
         const childStatus = state.childStatuses.get(id);
-        return childStatus !== undefined && isTerminalSubAgentStatus(childStatus);
+        return childStatus !== undefined && isTerminalSubAgentStatus(childStatus.status);
       })
     ) {
       return "running";
     }
-    if ([...state.childStatuses.values()].includes("failed")) return "failed";
-    if ([...state.childStatuses.values()].includes("canceled")) return "canceled";
+    if ([...state.childStatuses.values()].some((child) => child.status === "failed"))
+      return "failed";
+    if ([...state.childStatuses.values()].some((child) => child.status === "canceled"))
+      return "canceled";
     return "completed";
   }
 
@@ -7561,6 +7622,7 @@ export class CodexAppServerAgentSession implements AgentSession {
             childThreadIds: readCodexSpawnedSubAgentThreadIds(parsed.item),
             parentCallId: childSubAgentCallId,
             parentSubagentId: resolveCodexParentSubagentId(childSubAgentCallId, parsed.threadId),
+            emitCard: false,
           })
         : [];
     if (childSubAgentCallId) {

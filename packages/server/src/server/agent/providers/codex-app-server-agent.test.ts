@@ -4241,6 +4241,16 @@ describe("Codex app-server provider", () => {
 
   test.each([
     ["exec command", "codex/event/exec_command_begin", null],
+    [
+      "late completed item",
+      "item/completed",
+      { type: "agentMessage", id: "late-message", text: "Done" },
+    ],
+    [
+      "late completed compaction",
+      "item/completed",
+      { type: "contextCompaction", id: "late-compact" },
+    ],
     ["late reasoning", "item/reasoning/summaryTextDelta", null],
     [
       "late tool",
@@ -4431,7 +4441,7 @@ describe("Codex app-server provider", () => {
           event.event.type === "upsert" &&
           event.event.id === "child-a",
       ),
-    ).toEqual([expect.objectContaining({ event: expect.objectContaining({ status: "failed" }) })]);
+    ).toEqual([]);
     await asInternals(session).handleNotification("turn/completed", {
       threadId: "child-b",
       turn: { id: "first-b", status: "completed" },
@@ -4439,6 +4449,41 @@ describe("Codex app-server provider", () => {
     expect(events.findLast((event) => event.type === "timeline")).toMatchObject({
       item: { status: "failed" },
     });
+    await session.close();
+  });
+
+  test("keeps a completed spawn card settled after child activity and emits it once", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const item = {
+      type: "collabAgentToolCall",
+      id: "completed-spawn",
+      tool: "spawnAgent",
+      status: "completed",
+      receiverThreadIds: ["child-a", "child-b"],
+      prompt: "Work",
+      agentsStates: { "child-a": { status: "completed" }, "child-b": { status: "completed" } },
+    };
+    await asInternals(session).handleNotification("item/started", {
+      threadId: "test-thread",
+      item: { ...item, status: "inProgress", agentsStates: {} },
+    });
+    events.length = 0;
+    await asInternals(session).handleNotification("item/completed", {
+      threadId: "test-thread",
+      item,
+    });
+    expect(events.filter((event) => event.type === "timeline")).toHaveLength(1);
+    events.length = 0;
+    await asInternals(session).handleNotification("item/completed", {
+      threadId: "child-a",
+      item: { type: "agentMessage", id: "late-a", text: "Done" },
+    });
+    expect(events.filter((event) => event.type === "timeline")).toEqual([]);
+    expect(
+      events.filter((event) => event.type === "provider_subagent" && event.event.type === "upsert"),
+    ).toEqual([]);
     await session.close();
   });
 
