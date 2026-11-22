@@ -686,7 +686,12 @@ function isAgentBusy(status: AgentLifecycleStatus): boolean {
   return BUSY_STATUSES.has(status);
 }
 
-function isTurnTerminalEvent(event: AgentStreamEvent): boolean {
+function isTurnTerminalEvent(
+  event: AgentStreamEvent,
+): event is Extract<
+  AgentStreamEvent,
+  { type: "turn_completed" | "turn_failed" | "turn_canceled" }
+> {
   return (
     event.type === "turn_completed" ||
     event.type === "turn_failed" ||
@@ -864,7 +869,6 @@ export class AgentManager {
   private readonly timelineStore: InMemoryAgentTimelineStore;
   private readonly providerSubagents = new ProviderSubagentStore();
   private readonly providerSubagentCompletionStore?: ProviderSubagentCompletionStore;
-  private readonly restoredProviderSubagentCompletions = new Set<string>();
   private readonly backgroundWork = new AgentBackgroundWorkStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -1468,39 +1472,89 @@ export class AgentManager {
     return this.providerSubagents.list(parentAgentId);
   }
 
+  /** Consumer access stays on the daemon's single journal writer. */
+  completionEvents() {
+    if (!this.providerSubagentCompletionStore) throw new Error("Completion journal unavailable");
+    return this.providerSubagentCompletionStore;
+  }
+
   private async restoreProviderSubagentCompletions(parentAgentId: string): Promise<void> {
     const store = this.providerSubagentCompletionStore;
-    if (!store || this.restoredProviderSubagentCompletions.has(parentAgentId)) return;
-    const applyCompletion = (completion: Awaited<ReturnType<typeof store.readAll>>[number]) => {
-      const update = this.providerSubagents.apply(
-        parentAgentId,
-        completion.provider as AgentProvider,
-        {
-          type: "upsert",
-          id: completion.helperId,
-          status: completion.outcome,
-          parentSubagentId: completion.nativeParentId,
-          completionEvidence: {
-            sourceEventId: completion.sourceEventId,
-            nativeTurnId: completion.nativeTurnId,
-            nativeParentId: completion.nativeParentId,
-            role: completion.role,
-            sourceEventTime: completion.sourceEventTime,
-            provenance: completion.provenance,
-            outcome: completion.outcome,
-            gaps: completion.gaps,
-          },
-          ...(completion.sourceEventTime ? { timestamp: completion.sourceEventTime } : {}),
+    if (!store) return;
+    // Rebuild on every registration, including close/reload and history replacement.
+    // Acks describe delivery, not whether this process still has its projection.
+    for (const completion of await store.readAll(parentAgentId)) {
+      if (
+        completion.provenance !== "provider-stream" ||
+        completion.kind !== "completion" ||
+        completion.outcome === "unknown"
+      )
+        continue;
+      const update = this.providerSubagents.apply(parentAgentId, completion.provider, {
+        type: "upsert",
+        id: completion.helperId,
+        status: completion.outcome,
+        parentSubagentId: completion.nativeParentId,
+        completionEvidence: {
+          sourceEventId: completion.sourceEventId,
+          nativeTurnId: completion.nativeTurnId,
+          nativeParentId: completion.nativeParentId,
+          role: completion.role,
+          sourceEventTime: completion.sourceEventTime,
+          provenance: completion.provenance,
+          outcome: completion.outcome,
+          gaps: completion.gaps,
         },
-      );
+        ...(completion.sourceEventTime ? { timestamp: completion.sourceEventTime } : {}),
+      });
       this.dispatch({ type: "provider_subagent", event: update });
-    };
-    for (const completion of await store.readAll(parentAgentId)) applyCompletion(completion);
-    for (const completion of await store.replay(parentAgentId)) {
-      applyCompletion(completion);
       await store.acknowledge(parentAgentId, completion.sequence);
     }
-    this.restoredProviderSubagentCompletions.add(parentAgentId);
+  }
+
+  private async journalTerminalObservations(
+    agent: ActiveManagedAgent,
+    event?: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
+  ): Promise<void> {
+    const store = this.providerSubagentCompletionStore;
+    if (!store) return;
+    const parent = agent.labels[PARENT_AGENT_ID_LABEL];
+    if (parent && (event || agent.lifecycle === "running")) {
+      await store.append(
+        parent,
+        agent.provider,
+        {
+          type: "upsert",
+          id: agent.id,
+          status: event
+            ? (
+                {
+                  turn_completed: "completed",
+                  turn_failed: "failed",
+                  turn_canceled: "canceled",
+                } as const
+              )[event.type]
+            : undefined,
+          ...event?.completionSource,
+        },
+        "managed-lifecycle",
+        event ? [] : ["runtime closed without source terminal report"],
+      );
+    }
+    for (const helper of this.providerSubagents.list(agent.id)) {
+      if (helper.status !== "running") continue;
+      await store.append(
+        agent.id,
+        helper.provider,
+        { type: "upsert", id: helper.id, parentSubagentId: helper.parentSubagentId },
+        "daemon-observation",
+        [
+          event
+            ? "parent turn ended without helper terminal report"
+            : "runtime closed without helper terminal report",
+        ],
+      );
+    }
   }
 
   listAgentBackgroundWork(agentId: string): AgentBackgroundWorkItem[] {
@@ -1815,7 +1869,6 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
-    await this.restoreProviderSubagentCompletions(resolvedAgentId);
     const session = await client.resumeSession(
       handle,
       providerLaunchConfig,
@@ -2015,6 +2068,7 @@ export class AgentManager {
       // A persisted thread can have only one writer, even when its turn is idle.
       await this.closeReloadedSession(existing.session, agentId);
       await this.drainSessionEvents(agentId);
+      await this.journalTerminalObservations(existing);
       this.cancelRunningProviderSubagents(agentId);
       this.clearProviderBackgroundWork(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
@@ -2270,6 +2324,7 @@ export class AgentManager {
     // native writer, so publishing a resumable closed snapshot would orphan it.
     await agent.session.close();
     await this.drainSessionEvents(agentId);
+    await this.journalTerminalObservations(agent);
     this.cancelRunningProviderSubagents(agentId);
     // close() drops the session's subscribers before the provider could report an empty list.
     this.clearProviderBackgroundWork(agentId);
@@ -4570,6 +4625,7 @@ export class AgentManager {
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
       this.agents.set(resolvedAgentId, managed);
       registered = true;
+      await this.restoreProviderSubagentCompletions(resolvedAgentId);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       if (session.initialTimeline?.length) {
@@ -4943,7 +4999,7 @@ export class AgentManager {
       const update = this.providerSubagents.apply(
         agent.id,
         event.provider,
-        completion && event.event.type === "upsert"
+        completion && completion.outcome !== "unknown" && event.event.type === "upsert"
           ? {
               ...event.event,
               completionEvidence: {
@@ -5176,6 +5232,7 @@ export class AgentManager {
         this.dispatch({ type: "provider_subagent", event: update });
       }
     }
+    await this.restoreProviderSubagentCompletions(agent.id);
     for (const event of historyEvents) {
       const row = this.recordTimeline(
         agent.id,
@@ -5307,8 +5364,9 @@ export class AgentManager {
     event: AgentStreamEvent,
     options?: HandleStreamEventOptions,
   ): Promise<boolean> {
+    const fromHistory = options?.fromHistory === true;
     event = limitAgentStreamEventContent(event);
-    const identified = attachManagedTurnIdentity(agent, event, options?.fromHistory === true);
+    const identified = attachManagedTurnIdentity(agent, event, fromHistory);
     event = identified.event;
     const eventTurnId = identified.turnId;
     const isForegroundEvent = agent.activeForegroundTurnId === eventTurnId;
@@ -5323,7 +5381,7 @@ export class AgentManager {
     }
 
     // Only update timestamp for live events, not history replay
-    if (!options?.fromHistory) {
+    if (!fromHistory) {
       this.touchUpdatedAt(agent);
       if (this.agentStreamCoalescer.handle(agent.id, event)) {
         this.traceCoalescerBuffered(agent, event, eventTurnId);
@@ -5334,11 +5392,11 @@ export class AgentManager {
 
     let terminalDisposition: ActiveTurnTerminalDisposition = "untracked";
     if (isTurnTerminalEvent(event)) {
-      terminalDisposition = this.applyActiveTurnTerminal(
-        agent,
-        eventTurnId,
-        options?.fromHistory === true,
-      );
+      if (!fromHistory) {
+        // Native evidence survives routing normalization; persist before finish publication.
+        await this.journalTerminalObservations(agent, event);
+      }
+      terminalDisposition = this.applyActiveTurnTerminal(agent, eventTurnId, fromHistory);
     }
 
     const flags: StreamEventFlags = { shouldDispatchEvent: true, shouldNotifyWaiters: true };
@@ -5356,7 +5414,7 @@ export class AgentManager {
       await dispatchPromise;
     }
 
-    if (!options?.fromHistory) {
+    if (!fromHistory) {
       if (isTurnTerminalEvent(event)) {
         this.runs.settleTerminalRun(agent.id, eventTurnId);
         if (isForegroundEvent) {

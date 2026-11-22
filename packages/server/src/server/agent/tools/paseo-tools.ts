@@ -2176,6 +2176,76 @@ function createToolCatalog(
     },
   );
 
+  const helperConsumerSchema = z
+    .string()
+    .min(1)
+    .max(128)
+    .refine((name) => name !== "projection", "projection is reserved for daemon delivery");
+  registerTool(
+    "helper_completions",
+    {
+      title: "Helper completions",
+      description:
+        "Replay observed helper completions with a named durable consumer, acknowledge individual deliveries, or record a separate verification. Retention gaps require explicit acceptance. This host only.",
+      inputSchema: z.discriminatedUnion("operation", [
+        z.object({
+          operation: z.literal("replay"),
+          parentAgentId: z.string().min(1).max(128),
+          consumer: helperConsumerSchema,
+        }),
+        z.object({
+          operation: z.literal("acknowledge"),
+          parentAgentId: z.string().min(1).max(128),
+          consumer: helperConsumerSchema,
+          sequence: z.number().int().positive(),
+        }),
+        z.object({
+          operation: z.literal("accept_gap"),
+          parentAgentId: z.string().min(1).max(128),
+          consumer: helperConsumerSchema,
+          discardedThrough: z.number().int().nonnegative(),
+        }),
+        z.object({
+          operation: z.literal("release"),
+          parentAgentId: z.string().min(1).max(128),
+          consumer: helperConsumerSchema,
+        }),
+        z.object({
+          operation: z.literal("verify"),
+          parentAgentId: z.string().min(1).max(128),
+          sequence: z.number().int().positive(),
+          outcome: z.enum(["completed", "failed", "canceled", "unknown"]),
+          evidence: z.string().min(1).max(8192),
+        }),
+      ]),
+    },
+    async (input) => {
+      const store = agentManager.completionEvents();
+      let result: unknown;
+      switch (input.operation) {
+        case "replay":
+          result = await store.consume(input.parentAgentId, input.consumer);
+          break;
+        case "acknowledge":
+          await store.acknowledge(input.parentAgentId, input.sequence, input.consumer);
+          result = { acknowledged: input.sequence };
+          break;
+        case "accept_gap":
+          await store.acceptGap(input.parentAgentId, input.consumer, input.discardedThrough);
+          result = { acceptedThrough: input.discardedThrough };
+          break;
+        case "release":
+          await store.releaseConsumer(input.parentAgentId, input.consumer);
+          result = { released: true };
+          break;
+        case "verify":
+          result = await store.verify(input.parentAgentId, input.sequence, input);
+          break;
+      }
+      return { content: [], structuredContent: ensureValidJson(result) };
+    },
+  );
+
   registerTool(
     "list_agents",
     {

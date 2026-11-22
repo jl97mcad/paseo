@@ -2820,6 +2820,7 @@ type ParsedCodexNotification =
   | { kind: "turn_started"; turnId: string; threadId: string | null }
   | {
       kind: "turn_completed";
+      nativeTurnId?: string;
       status: string;
       errorMessage: string | null;
       threadId: string | null;
@@ -2980,6 +2981,7 @@ const CodexNotificationSchema = z.union([
     .transform(
       ({ params }): ParsedCodexNotification => ({
         kind: "turn_completed",
+        nativeTurnId: params.turn.id,
         status: params.turn.status,
         errorMessage: params.turn.error?.message ?? null,
         threadId: params.threadId ?? null,
@@ -6617,7 +6619,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private emitSubAgentActivityUpdate(
     callId: string,
     status?: ToolCallTimelineItem["status"],
-    options?: { reopen?: boolean; subAgentType?: string },
+    options?: { reopen?: boolean; subAgentType?: string; nativeTurnId?: string },
   ): void {
     const state = this.subAgentCallsByCallId.get(callId);
     if (!state || state.toolCall.detail.type !== "sub_agent") {
@@ -6654,7 +6656,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     const cardChanged = !isDeepStrictEqual(nextToolCall, state.toolCall);
     state.toolCall = nextToolCall;
     for (const childThreadId of state.childThreadIds) {
-      this.emitProviderSubagentUpsert(childThreadId, state, resolvedStatus);
+      this.emitProviderSubagentUpsert(childThreadId, state, resolvedStatus, options?.nativeTurnId);
     }
     if (!cardChanged || (state.parentCallId && state.parentCallId !== callId)) {
       return;
@@ -6666,6 +6668,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     childThreadId: string,
     state: CodexSubAgentCallState,
     status: ToolCallTimelineItem["status"],
+    nativeTurnId?: string,
   ): void {
     const detail = state.toolCall.detail;
     if (detail.type !== "sub_agent") {
@@ -6690,6 +6693,8 @@ export class CodexAppServerAgentSession implements AgentSession {
         status: providerStatus,
         toolCallId: state.callId,
         parentSubagentId: state.parentSubagentId,
+        nativeTurnId,
+        role: detail.subAgentType ?? undefined,
       },
     });
   }
@@ -6947,7 +6952,9 @@ export class CodexAppServerAgentSession implements AgentSession {
       } else if (parsed.status === "interrupted") {
         status = "canceled";
       }
-      this.emitSubAgentActivityUpdate(subAgentCallId, status);
+      this.emitSubAgentActivityUpdate(subAgentCallId, status, {
+        nativeTurnId: parsed.nativeTurnId,
+      });
       return;
     }
     this.completePendingRootCompactions();
@@ -6959,11 +6966,21 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (parsed.status === "failed") {
       const error = parsed.errorMessage ?? "Codex turn failed";
       this.settleStreamRetry({ status: "failed", error });
-      this.emitEvent({ type: "turn_failed", provider: CODEX_PROVIDER, error });
+      this.emitEvent({
+        type: "turn_failed",
+        provider: CODEX_PROVIDER,
+        error,
+        completionSource: { nativeTurnId: parsed.nativeTurnId },
+      });
     } else if (parsed.status === "interrupted") {
       this.settleStreamRetry({ status: "canceled" });
       this.dismissInterruptedAsyncQuestions();
-      this.emitEvent({ type: "turn_canceled", provider: CODEX_PROVIDER, reason: "interrupted" });
+      this.emitEvent({
+        type: "turn_canceled",
+        provider: CODEX_PROVIDER,
+        reason: "interrupted",
+        completionSource: { nativeTurnId: parsed.nativeTurnId },
+      });
     } else {
       this.settleStreamRetry({ status: "completed" });
       if (this.planModeEnabled && this.latestPlanResult?.text) {
@@ -6973,6 +6990,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         type: "turn_completed",
         provider: CODEX_PROVIDER,
         usage: this.latestUsage,
+        completionSource: { nativeTurnId: parsed.nativeTurnId },
       });
     }
     this.activeForegroundTurnId = null;

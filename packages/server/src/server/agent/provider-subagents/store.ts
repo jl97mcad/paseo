@@ -53,6 +53,9 @@ export type ProviderSubagentInputEvent =
       subtitle?: string | null;
       parentSubagentId?: string | null;
       timestamp?: string;
+      sourceEventId?: string;
+      nativeTurnId?: string;
+      role?: string;
       completionEvidence?: ProviderSubagentCompletionEvidence;
     }
   | {

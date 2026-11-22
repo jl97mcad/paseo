@@ -3,6 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { createAgentMcpServer } from "./mcp-server.js";
+import { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
+import { writeJsonFileAtomic } from "../atomic-file.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
@@ -11,6 +17,11 @@ import { ensureAgentLoaded } from "./agent-loading.js";
 import { AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS } from "./agent-stream-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
+import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
+import {
+  createFakeCodexAppServer,
+  waitForNextEvent,
+} from "./providers/codex/test-utils/fake-app-server.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import { FakeOmp } from "./providers/omp/test-utils/fake-omp.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
@@ -1663,6 +1674,7 @@ test("replays a silent provider subagent completion after manager restart", asyn
     event: {
       type: "upsert",
       id: "helper-1",
+      sourceEventId: "native-completion-1",
       status: "completed",
       timestamp: "2026-01-02T03:04:05.000Z",
     },
@@ -1673,6 +1685,7 @@ test("replays a silent provider subagent completion after manager restart", asyn
     event: {
       type: "upsert",
       id: "helper-1",
+      sourceEventId: "native-completion-1",
       status: "completed",
       timestamp: "2026-01-02T03:04:05.000Z",
     },
@@ -1699,11 +1712,7 @@ test("replays a silent provider subagent completion after manager restart", asyn
       sourceEventTime: "2026-01-02T03:04:05.000Z",
       provenance: "provider-stream",
       outcome: "completed",
-      gaps: [
-        "native event identity unavailable",
-        "native turn identity unavailable",
-        "helper role unavailable",
-      ],
+      gaps: ["native turn identity unavailable", "helper role unavailable"],
     },
     {
       helperId: "helper-2",
@@ -1714,6 +1723,7 @@ test("replays a silent provider subagent completion after manager restart", asyn
         "native turn identity unavailable",
         "helper role unavailable",
         "source event time unavailable",
+        "deduplication identity unavailable",
       ],
     },
   ]);
@@ -1727,6 +1737,7 @@ test("replays a silent provider subagent completion after manager restart", asyn
   const crashEvent = {
     type: "upsert" as const,
     id: "helper-3",
+    sourceEventId: "native-completion-3",
     status: "canceled" as const,
     timestamp: "2026-01-02T03:05:00.000Z",
   };
@@ -1757,5 +1768,370 @@ test("replays a silent provider subagent completion after manager restart", asyn
   });
   expect(recovered.find(({ id }) => id === "helper-3")?.status).toBe("canceled");
   await expect(restartedStorage.get(agentId)).resolves.toMatchObject({ id: agentId });
-  await rmSync(root, { recursive: true, force: true });
+  await restarted.closeAgent(agentId);
+  await restarted.flush();
+  await restartedStorage.flush();
+  // Loading again in the same manager must rebuild even already acknowledged events.
+  await ensureAgentLoaded(agentId, {
+    agentManager: restarted,
+    agentStorage: restartedStorage,
+    logger,
+  });
+  expect(restarted.listProviderSubagents(agentId).map(({ id }) => id)).toEqual(
+    expect.arrayContaining(["helper-1", "helper-2", "helper-3"]),
+  );
+  await restarted.closeAgent(agentId);
+  await restarted.flush();
+  await restartedStorage.flush();
+});
+
+test("durable consumers keep independent acknowledgements and uncertain deliveries", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-consumers-"));
+  const store = new ProviderSubagentCompletionStore(root);
+  const first = await store.append("parent", "codex", {
+    type: "upsert",
+    id: "helper",
+    status: "completed",
+  });
+  const second = await store.append("parent", "codex", {
+    type: "upsert",
+    id: "helper",
+    status: "completed",
+  });
+  expect(first?.sequence).not.toBe(second?.sequence);
+  expect(first?.gaps).toContain("deduplication identity unavailable");
+  const native = {
+    type: "upsert",
+    id: "helper",
+    status: "failed",
+    sourceEventId: "event-1",
+    nativeTurnId: "turn-2",
+    role: "worker",
+  } as const;
+  const third = await store.append("parent", "codex", native);
+  expect(await store.append("parent", "codex", native)).toEqual(third);
+  expect(third).toMatchObject({ sourceEventId: "event-1", nativeTurnId: "turn-2", role: "worker" });
+  if (!first || !second || !third) throw new Error("missing observations");
+  await store.acknowledge("parent", second.sequence, "consumer-a");
+  expect((await store.replay("parent", "consumer-a")).map((e) => e.sequence)).toEqual([
+    first.sequence,
+    third.sequence,
+  ]);
+  const restarted = new ProviderSubagentCompletionStore(root);
+  expect(await restarted.replay("parent", "consumer-b")).toHaveLength(3);
+  expect(await restarted.replay("parent", "consumer-a")).toHaveLength(2);
+  const unknown = await restarted.append("parent", "codex", { type: "upsert", id: "silent" });
+  expect(unknown).toMatchObject({ outcome: "unknown" });
+  const verification = await restarted.verify("parent", first.sequence, {
+    outcome: "failed",
+    evidence: "independent check",
+  });
+  expect(verification).toMatchObject({
+    kind: "verification",
+    verifiesSequence: first.sequence,
+    outcome: "failed",
+  });
+  expect((await restarted.readAll("parent"))[0]).toEqual(first);
+  const timed = {
+    type: "upsert",
+    id: "timed",
+    status: "completed",
+    timestamp: "2026-01-01T00:00:00Z",
+  } as const;
+  const timedFirst = await restarted.append("parent", "codex", timed);
+  const timedSecond = await restarted.append("parent", "codex", timed);
+  expect(timedFirst?.deliveryId).not.toBe(timedSecond?.deliveryId);
+});
+
+test("managed child terminal settlement is durable without a final report", async () => {
+  const root = mkdtempSync(join(tmpdir(), "managed-completions-"));
+  const logger = createTestLogger();
+  const client = new TestAgentClient();
+  const storage = new AgentStorage(join(root, "agents"), logger);
+  const store = new ProviderSubagentCompletionStore(root);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+    labels: { [PARENT_AGENT_ID_LABEL]: AGENT_IDS[1] },
+  });
+  const session = client.getSession(root);
+  session.pushEvent({ type: "turn_started", provider: "codex", turnId: "native-1" });
+  session.pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: { type: "upsert", id: "silent-helper", status: "running" },
+  });
+  session.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "native-1",
+    completionSource: { nativeTurnId: "native-1" },
+  });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  expect(await store.readAll(AGENT_IDS[1])).toMatchObject([
+    {
+      helperId: AGENT_IDS[0],
+      nativeTurnId: "native-1",
+      provenance: "managed-lifecycle",
+      outcome: "completed",
+    },
+  ]);
+  expect(await store.readAll(AGENT_IDS[0])).toMatchObject([
+    {
+      helperId: "silent-helper",
+      outcome: "unknown",
+      gaps: expect.arrayContaining(["parent turn ended without helper terminal report"]),
+    },
+  ]);
+  const restarted = new ProviderSubagentCompletionStore(root);
+  expect(await restarted.replay(AGENT_IDS[1], "automation")).toHaveLength(1);
+  // Repeated source delivery is one observation, even after the turn was applied.
+  session.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "native-1",
+    completionSource: { nativeTurnId: "native-1" },
+  });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  expect(await store.readAll(AGENT_IDS[1])).toHaveLength(1);
+  for (const [index, type] of ["turn_failed", "turn_canceled"].entries()) {
+    const turnId = `native-${index + 2}`;
+    session.pushEvent({ type: "turn_started", provider: "codex", turnId });
+    session.pushEvent(
+      type === "turn_failed"
+        ? {
+            type: "turn_failed",
+            provider: "codex",
+            turnId,
+            error: "failed",
+            completionSource: { nativeTurnId: turnId },
+          }
+        : {
+            type: "turn_canceled",
+            provider: "codex",
+            turnId,
+            reason: "canceled",
+            completionSource: { nativeTurnId: turnId },
+          },
+    );
+    await waitForSessionEventQueue();
+  }
+  await manager.flush();
+  expect((await store.readAll(AGENT_IDS[1])).map((e) => e.outcome)).toEqual([
+    "completed",
+    "failed",
+    "canceled",
+  ]);
+  session.pushEvent({ type: "turn_started", provider: "codex", turnId: "adapter-generated" });
+  session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "adapter-generated" });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  expect((await store.readAll(AGENT_IDS[1])).at(-1)).toMatchObject({
+    nativeTurnId: null,
+    gaps: expect.arrayContaining([
+      "native turn identity unavailable",
+      "deduplication identity unavailable",
+    ]),
+  });
+  session.pushEvent({ type: "turn_started", provider: "codex", turnId: "interrupted-runtime" });
+  await waitForSessionEventQueue();
+  await manager.closeAgent(AGENT_IDS[0]);
+  await manager.flush();
+  expect((await store.readAll(AGENT_IDS[1])).at(-1)).toMatchObject({
+    outcome: "unknown",
+    gaps: expect.arrayContaining(["runtime closed without source terminal report"]),
+  });
+});
+
+test("MCP consumers replay and ack independently across daemon reload", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-api-"));
+  const logger = createTestLogger();
+  const store = new ProviderSubagentCompletionStore(root);
+  const storage = new AgentStorage(join(root, "agents"), logger);
+  const manager = new AgentManager({ clients: {}, providerSubagentCompletionStore: store, logger });
+  await store.append("parent", "codex", { type: "upsert", id: "helper", status: "completed" });
+  const providers = new ProviderSnapshotManager({ logger });
+  const server = await createAgentMcpServer({
+    agentManager: manager,
+    agentStorage: storage,
+    providerSnapshotManager: providers,
+    logger,
+  });
+  const client = new Client({ name: "completion-consumer-test", version: "1" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const replay = await client.callTool({
+      name: "helper_completions",
+      arguments: { operation: "replay", parentAgentId: "parent", consumer: "automation" },
+    });
+    expect(replay.isError).not.toBe(true);
+    expect(replay.structuredContent).toMatchObject({
+      events: [{ sequence: 1, helperId: "helper" }],
+      gap: null,
+    });
+    expect(
+      (
+        await client.callTool({
+          name: "helper_completions",
+          arguments: {
+            operation: "acknowledge",
+            parentAgentId: "parent",
+            consumer: "automation",
+            sequence: 1,
+          },
+        })
+      ).isError,
+    ).not.toBe(true);
+    expect(
+      await new ProviderSubagentCompletionStore(root).replay("parent", "automation"),
+    ).toHaveLength(0);
+    expect(await store.replay("parent", "another-consumer")).toHaveLength(1);
+    const verified = await client.callTool({
+      name: "helper_completions",
+      arguments: {
+        operation: "verify",
+        parentAgentId: "parent",
+        sequence: 1,
+        outcome: "unknown",
+        evidence: "No independent result available",
+      },
+    });
+    expect(verified.structuredContent).toMatchObject({
+      kind: "verification",
+      verifiesSequence: 1,
+      outcome: "unknown",
+    });
+    const invalid = await client.callTool({
+      name: "helper_completions",
+      arguments: {
+        operation: "acknowledge",
+        parentAgentId: "parent",
+        consumer: "automation",
+        sequence: 999,
+      },
+    });
+    expect(invalid.isError).toBe(true);
+  } finally {
+    await client.close();
+    await server.close();
+    providers.destroy();
+    await manager.flush();
+    await storage.flush();
+  }
+});
+
+test("retention reports replay gaps and never reuses delivery sequences", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-retention-"));
+  const store = new ProviderSubagentCompletionStore(root, 2);
+  for (let i = 0; i < 3; i++)
+    await store.append("parent", "codex", {
+      type: "upsert",
+      id: `helper-${i}`,
+      status: "completed",
+    });
+  expect(await store.consume("parent", "consumer")).toMatchObject({
+    events: [{ sequence: 2 }, { sequence: 3 }],
+    gap: { discardedThrough: 1 },
+  });
+  await expect(store.replay("parent", "consumer")).rejects.toThrow("replay gap");
+  await store.acknowledge("parent", 2, "consumer");
+  expect((await store.consume("parent", "consumer")).gap).toEqual({ discardedThrough: 1 });
+  await store.acceptGap("parent", "consumer", 1);
+  expect(await store.replay("parent", "consumer")).toMatchObject([{ sequence: 3 }]);
+  const restarted = new ProviderSubagentCompletionStore(root, 2);
+  expect(
+    await restarted.append("parent", "codex", { type: "upsert", id: "next", status: "completed" }),
+  ).toMatchObject({ sequence: 4 });
+  expect(await restarted.readAll("parent")).toHaveLength(2);
+});
+
+test("apply before ack failure redelivers and rebuilds the projection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-ack-crash-"));
+  const logger = createTestLogger();
+  const client = new TestAgentClient();
+  const storage = new AgentStorage(join(root, "agents"), logger);
+  let writes = 0;
+  const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+    if (++writes === 2) throw new Error("simulated crash before ack persistence");
+    await writeJsonFileAtomic(file, data);
+  });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+  });
+  client.getSession(root).pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: { type: "upsert", id: "helper", status: "completed", sourceEventId: "terminal-1" },
+  });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+    { id: "helper", status: "completed" },
+  ]);
+  const recoveredStore = new ProviderSubagentCompletionStore(root);
+  expect(await recoveredStore.replay(AGENT_IDS[0])).toMatchObject([{ helperId: "helper" }]);
+  await manager.closeAgent(AGENT_IDS[0]);
+  await manager.flush();
+  await storage.flush();
+  const recoveredStorage = new AgentStorage(join(root, "agents"), logger);
+  const recovered = new AgentManager({
+    clients: { codex: client },
+    registry: recoveredStorage,
+    providerSubagentCompletionStore: recoveredStore,
+    logger,
+  });
+  await ensureAgentLoaded(AGENT_IDS[0], {
+    agentManager: recovered,
+    agentStorage: recoveredStorage,
+    logger,
+  });
+  expect(recovered.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+    { id: "helper", status: "completed" },
+  ]);
+  expect(await recoveredStore.replay(AGENT_IDS[0])).toHaveLength(0);
+  await recovered.closeAgent(AGENT_IDS[0]);
+  await recovered.flush();
+  await recoveredStorage.flush();
+});
+
+test("Codex preserves native terminal identity separately from normalized routing identity", async () => {
+  const appServer = createFakeCodexAppServer();
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), model: "gpt-5.4" },
+    null,
+    createTestLogger(),
+    async () => appServer.child,
+  );
+  try {
+    const started = await session.startTurn("first");
+    await appServer.waitForTurnStart();
+    appServer.startsTurn({ threadId: "thread-1", turnId: "provider-native-turn" });
+    const terminal = waitForNextEvent(session, "turn_completed");
+    appServer.child.stdout.write(
+      `${JSON.stringify({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "provider-native-turn", status: "completed" } } })}\n`,
+    );
+    const event = await terminal;
+    expect(event.turnId).toBe(started.turnId);
+    expect(event.completionSource?.nativeTurnId).toBe("provider-native-turn");
+    expect(event.turnId).not.toBe(event.completionSource?.nativeTurnId);
+    appServer.assertNoErrors();
+  } finally {
+    await session.close();
+    appServer.disconnect();
+  }
 });

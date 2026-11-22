@@ -1,6 +1,6 @@
 # Provider subagent completion journal
 
-Status: accepted
+Status: superseded by [Durable helper observations and consumers](helper-completion-consumers.md)
 
 ## Decision
 
