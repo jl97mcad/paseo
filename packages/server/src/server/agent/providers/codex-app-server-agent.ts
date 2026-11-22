@@ -5612,9 +5612,9 @@ export class CodexAppServerAgentSession implements AgentSession {
     const threadIds = new Set([this.currentThreadId, ...loaded.data]);
     for (const threadId of threadIds) {
       const response = z
-        .object({ data: z.array(z.unknown()), nextCursor: z.string().nullable() })
+        .object({ data: z.array(z.unknown()), nextCursor: z.string().nullish() })
         .parse(await this.client.request("thread/backgroundTerminals/list", { threadId }, 10_000));
-      if (response.data.length > 0 || response.nextCursor !== null) return false;
+      if (response.data.length > 0 || response.nextCursor != null) return false;
     }
     return !this.client.hasPendingRequests();
   }

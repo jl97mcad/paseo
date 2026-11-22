@@ -8789,6 +8789,8 @@ test("Codex runtime safety queries live terminals and retains unsupported app se
     appServer.completeTurn({ threadId: "thread-1" });
     await new Promise<void>((resolve) => setImmediate(resolve));
     await expect.poll(() => session.canStopRuntime()).toBe(true);
+    response = { data: [] };
+    expect(await session.canStopRuntime()).toBe(true);
     response = { data: [{ processId: "shell-1" }], nextCursor: null };
     expect(await session.canStopRuntime()).toBe(false);
     response = {};
