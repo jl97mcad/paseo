@@ -34,7 +34,7 @@ interface CoordinatorOptions {
   maxAttempts?: number;
 }
 
-async function waitForSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+export async function waitForSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   signal.throwIfAborted();
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_resolve, reject) => {

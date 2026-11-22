@@ -103,7 +103,7 @@ import {
   type CodexThreadRollbackResponse,
   type CodexAppServerTraceContext,
 } from "./codex/app-server-transport.js";
-import { codexAppServerStartup } from "./codex/app-server-startup.js";
+import { codexAppServerStartup, waitForSignal } from "./codex/app-server-startup.js";
 import { type CodexUserMessageTurnIndex, revertCodexConversation } from "./codex/rewind.js";
 import {
   type CodexHistoryRow,
@@ -3756,6 +3756,7 @@ interface ConsumedRootCompaction {
 
 // ponytail: serialize transient inventories; partition by Codex home if command latency becomes material.
 const limitCodexSkillInventory = pLimit(1);
+const TEMPORARY_READ_TIMEOUT_MS = 60_000;
 
 export class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
@@ -4394,27 +4395,64 @@ export class CodexAppServerAgentSession implements AgentSession {
     );
   }
 
-  private async readArchivedHistory(): Promise<CodexThreadHistory> {
-    const { client } = await codexAppServerStartup.start({
-      stateDirKey: codexStartupStateDirKey(this.harnessEnvironment),
-      spawn: this.spawnAppServer,
-      createClient: (child) =>
-        new CodexAppServerClient(child, this.logger, () => this.traceContext()),
-      initializeParams: buildCodexAppServerInitializeParams(),
-      logger: this.logger,
-      signal: this.startupAbort.signal,
-    });
+  private async withTemporaryClient<T>(
+    purpose: "history" | "skills",
+    read: (client: CodexAppServerClient, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const deadline = new AbortController();
+    const expiresAt = Date.now() + TEMPORARY_READ_TIMEOUT_MS;
+    const timeoutError = new Error(`Codex temporary ${purpose} read timed out`);
+    const timer = setTimeout(() => deadline.abort(timeoutError), TEMPORARY_READ_TIMEOUT_MS);
+    const signal = AbortSignal.any([deadline.signal, this.startupAbort.signal]);
+    let entered = false;
+    const run = async () => {
+      entered = true;
+      // A queued read can enter before its already-due timer callback runs.
+      if (Date.now() >= expiresAt) deadline.abort(timeoutError);
+      signal.throwIfAborted();
+      const { client } = await codexAppServerStartup.start({
+        stateDirKey: codexStartupStateDirKey(this.harnessEnvironment),
+        spawn: this.spawnAppServer,
+        createClient: (child) =>
+          new CodexAppServerClient(child, this.logger, () => this.traceContext()),
+        initializeParams: buildCodexAppServerInitializeParams(),
+        logger: this.logger,
+        signal,
+      });
+      try {
+        signal.throwIfAborted();
+        const value = await waitForSignal(read(client, signal), signal);
+        if (Date.now() >= expiresAt) deadline.abort(timeoutError);
+        signal.throwIfAborted();
+        return value;
+      } finally {
+        await client.dispose({ force: true });
+      }
+    };
+    const operation = purpose === "skills" ? limitCodexSkillInventory(run) : run();
     try {
-      return await this.readThreadHistory(client);
+      return await waitForSignal(operation, signal);
+    } catch (error) {
+      // A queued inventory must not spawn after cancellation. An entered read
+      // must finish its bounded startup/client teardown before reporting failure.
+      if (entered) await operation;
+      throw error;
     } finally {
-      await client.dispose({ force: true });
+      clearTimeout(timer);
     }
+  }
+
+  private readArchivedHistory(): Promise<CodexThreadHistory> {
+    return this.withTemporaryClient("history", (client, signal) =>
+      this.readThreadHistory(client, signal),
+    );
   }
 
   // Reads the thread and its sub-agent threads, rebuilding the turn index and
   // sub-agent routes. The caller owns the returned history; nothing retains it.
   private async readThreadHistory(
     client: CodexAppServerClientLike | null,
+    signal?: AbortSignal,
   ): Promise<CodexThreadHistory> {
     if (!client || !this.currentThreadId) {
       return { timeline: [], providerSubagentEvents: [] };
@@ -4424,13 +4462,14 @@ export class CodexAppServerAgentSession implements AgentSession {
       threadId: this.currentThreadId,
       cwd: this.config.cwd ?? null,
     });
+    signal?.throwIfAborted();
     this.subAgentCallsByCallId.clear();
     this.subAgentCallIdByChildThreadId.clear();
     this.pendingSubAgentNotificationsByThreadId.clear();
     const providerSubagentEvents: AgentStreamEvent[] = [];
     this.historySubagentEvents = providerSubagentEvents;
     try {
-      await this.loadPersistedSubAgentHistories(client, subAgentRoutes);
+      await this.loadPersistedSubAgentHistories(client, subAgentRoutes, signal);
     } finally {
       this.historySubagentEvents = null;
     }
@@ -4457,6 +4496,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private async loadPersistedSubAgentHistories(
     client: CodexAppServerClientLike,
     rootRoutes: readonly PersistedSubAgentRoute[],
+    signal?: AbortSignal,
   ): Promise<void> {
     const queue = rootRoutes.map((route) => ({
       route,
@@ -4469,7 +4509,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       state: CodexSubAgentCallState;
       timeline: readonly PersistedTimelineEntry[];
     }[] = [];
-    while (queue.length > 0 && visitedThreadIds.size < 100) {
+    while (queue.length > 0) {
+      signal?.throwIfAborted();
       const next = queue.shift();
       if (!next || visitedThreadIds.has(next.route.childThreadId)) {
         continue;
@@ -4496,6 +4537,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           readLatestTurn:
             next.route.legacyCollaboration && !isTerminalSubAgentStatus(toolCall.status),
         });
+        signal?.throwIfAborted();
         if (next.route.legacyCollaboration) {
           restoreCollabAgentCallFromChildHistory(state, toolCall, childHistory.status);
         }
@@ -4508,6 +4550,7 @@ export class CodexAppServerAgentSession implements AgentSession {
           });
         }
       } catch (error) {
+        signal?.throwIfAborted();
         this.logger.trace(
           { err: error, childThreadId: next.route.childThreadId },
           "Failed to load persisted Codex child history",
@@ -5812,29 +5855,17 @@ export class CodexAppServerAgentSession implements AgentSession {
   async listCommands(): Promise<AgentSlashCommand[]> {
     const prompts = await listCodexCustomPrompts(this.codexHome);
     if (this.connectionState === "history-ready") {
-      await limitCodexSkillInventory(async () => {
-        const { client } = await codexAppServerStartup.start({
-          stateDirKey: codexStartupStateDirKey(this.harnessEnvironment),
-          spawn: this.spawnAppServer,
-          createClient: (child) => new CodexAppServerClient(child, this.logger),
-          initializeParams: buildCodexAppServerInitializeParams(),
-          logger: this.logger,
-          signal: this.startupAbort.signal,
-        });
-        try {
-          const response = toObjectRecord(
-            await client.request("skills/list", { cwds: [this.config.cwd] }, 10_000),
-          );
-          const entries = Array.isArray(response?.data) ? response.data : [];
-          this.cachedSkills = enabledCodexSkills(
-            entries.flatMap((entry) => {
-              const skills = toObjectRecord(entry)?.skills;
-              return Array.isArray(skills) ? skills : [];
-            }),
-          );
-        } finally {
-          await client.dispose({ force: true });
-        }
+      await this.withTemporaryClient("skills", async (client) => {
+        const response = toObjectRecord(
+          await client.request("skills/list", { cwds: [this.config.cwd] }, 10_000),
+        );
+        const entries = Array.isArray(response?.data) ? response.data : [];
+        this.cachedSkills = enabledCodexSkills(
+          entries.flatMap((entry) => {
+            const skills = toObjectRecord(entry)?.skills;
+            return Array.isArray(skills) ? skills : [];
+          }),
+        );
       });
     } else if (this.connectionState === "disconnected") {
       await this.connect();

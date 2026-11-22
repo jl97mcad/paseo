@@ -917,6 +917,308 @@ test("a prompt admitted during the idle probe prevents collection", async () => 
   }
 }, 30_000);
 
+function createTemporaryReadSession(server: FakeCodexAppServer, sessionId: string | null) {
+  return new CodexAppServerAgentSession(
+    createConfig(),
+    sessionId ? { sessionId } : null,
+    createTestLogger(),
+    async () => server.child,
+    {},
+    false,
+    false,
+    false,
+    undefined,
+    "history",
+  );
+}
+
+test("temporary history read bounds startup and all pagination together", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const delayed = (value: unknown, ms: number) =>
+    new Promise<unknown>((resolve) => setTimeout(() => resolve(value), ms));
+  let page = 0;
+  const server = createFakeCodexAppServer({
+    initialize: () => delayed({}, 20_000),
+    "thread/read": () => delayed({ thread: { historyMode: "paginated" } }, 20_000),
+    "thread/items/list": () =>
+      delayed(
+        {
+          data: [{ turnId: "turn-1", item: codexAgentItem(`Page ${++page}`) }],
+          nextCursor: `page-${page}`,
+        },
+        12_000,
+      ),
+  });
+  let exited = false;
+  server.child.once("exit", () => {
+    exited = true;
+  });
+  const session = createTemporaryReadSession(server, "archived-thread-id");
+  let outcome: unknown = "pending";
+  const connecting = session.connect().then(
+    () => {
+      outcome = "success";
+      return undefined;
+    },
+    (error: unknown) => {
+      outcome = error;
+    },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(outcome).toEqual(new Error("Codex temporary history read timed out"));
+    expect(exited).toBe(true);
+    expect(page).toBe(2);
+  } finally {
+    server.disconnect();
+    await connecting;
+    await session.close();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test.each(["history", "skills"] as const)(
+  "temporary %s read releases a server whose initialization stalls",
+  async (purpose) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const server = createFakeCodexAppServer({ initialize: () => new Promise(() => {}) });
+    let exits = 0;
+    server.child.once("exit", () => {
+      exits++;
+    });
+    const session = createTemporaryReadSession(server, purpose === "history" ? "saved" : null);
+    if (purpose === "skills") await session.connect();
+    let outcome: unknown = "pending";
+    const reading = (purpose === "history" ? session.connect() : session.listCommands()).catch(
+      (error: unknown) => {
+        outcome = error;
+      },
+    );
+    try {
+      // Command reads first consult the real filesystem for custom prompts.
+      await server.waitForRequest("initialize");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(outcome).toEqual(new Error("Timed out initializing Codex app-server"));
+      expect(exits).toBe(1);
+      expect(server.requests().map((request) => request.method)).toEqual(["initialize"]);
+    } finally {
+      server.disconnect();
+      await reading;
+      await session.close();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  },
+);
+
+test("temporary history read bounds descendant replay without returning partial history", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const childIds: string[] = [];
+  const server = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      if (
+        typeof params !== "object" ||
+        params === null ||
+        !("threadId" in params) ||
+        typeof params.threadId !== "string" ||
+        !("includeTurns" in params)
+      ) {
+        throw new Error("Invalid thread/read fixture request");
+      }
+      const request = params;
+      childIds.push(request.threadId);
+      const items =
+        request.threadId === "root"
+          ? ["child-1", "child-2"].map((id) => ({
+              type: "subAgentActivity",
+              id: `spawn-${id}`,
+              kind: "started",
+              agentThreadId: id,
+              agentPath: `/root/${id}`,
+            }))
+          : [codexAgentItem("Descendant response")];
+      return new Promise((resolve) =>
+        setTimeout(
+          () =>
+            resolve({
+              thread: { turns: request.includeTurns ? [{ items }] : [] },
+            }),
+          request.threadId === "root" ? 20_000 : 15_000,
+        ),
+      );
+    },
+  });
+  let exited = false;
+  server.child.once("exit", () => {
+    exited = true;
+  });
+  const session = createTemporaryReadSession(server, "root");
+  let outcome: unknown = "pending";
+  const reading = session.connect().then(
+    () => {
+      outcome = "success";
+      return undefined;
+    },
+    (error: unknown) => {
+      outcome = error;
+    },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(outcome).toEqual(new Error("Codex temporary history read timed out"));
+    expect(exited).toBe(true);
+    expect(childIds).toEqual(["root", "root", "child-1", "child-1"]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(childIds).toEqual(["root", "root", "child-1", "child-1"]);
+  } finally {
+    server.disconnect();
+    await reading;
+    await session.close();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test("temporary history read retains every nested descendant beyond one hundred threads", async () => {
+  const server = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      if (
+        typeof params !== "object" ||
+        params === null ||
+        !("threadId" in params) ||
+        typeof params.threadId !== "string"
+      )
+        throw new Error("Invalid fixture thread id");
+      const index = Number(params.threadId);
+      const items: unknown[] = [codexAgentItem(`History ${index}`)];
+      if (index < 105)
+        items.push({
+          type: "subAgentActivity",
+          id: `spawn-${index + 1}`,
+          kind: "started",
+          agentThreadId: String(index + 1),
+          agentPath: `/root/${index + 1}`,
+        });
+      return { thread: { turns: [{ items }] } };
+    },
+  });
+  let exits = 0;
+  server.child.once("exit", () => {
+    exits++;
+  });
+  const session = createTemporaryReadSession(server, "0");
+  try {
+    await session.connect();
+    const descendants: string[] = [];
+    for await (const event of session.streamHistory()) {
+      if (
+        event.type === "provider_subagent" &&
+        event.event.type === "timeline" &&
+        event.event.item.type === "assistant_message"
+      ) {
+        descendants.push(event.event.item.text);
+      }
+    }
+    expect(descendants).toEqual(Array.from({ length: 105 }, (_, i) => `History ${i + 1}`));
+    expect(exits).toBe(1);
+  } finally {
+    await session.close();
+  }
+});
+
+test("temporary history read waits for teardown and reports a child that fails to exit", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const signals: (NodeJS.Signals | number | undefined)[] = [];
+  const server = createFakeCodexAppServer({
+    "thread/read": () => ({ thread: { turns: [] } }),
+  });
+  server.child.kill = (signal) => {
+    signals.push(signal);
+    return false;
+  };
+  const session = createTemporaryReadSession(server, "saved");
+  let outcome: unknown = "pending";
+  const reading = session.connect().then(
+    () => {
+      outcome = "success";
+      return undefined;
+    },
+    (error: unknown) => {
+      outcome = error;
+    },
+  );
+  try {
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(outcome).toBe("pending");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(outcome).toEqual(new Error("Codex app-server did not report exit after SIGKILL"));
+    expect(signals).toEqual(["SIGKILL", "SIGKILL"]);
+  } finally {
+    server.disconnect();
+    await reading;
+    await session.close();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
+test("temporary skill reads include inventory queue time and never spawn expired waiters", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const servers: FakeCodexAppServer[] = [];
+  let exits = 0;
+  const session = new CodexAppServerAgentSession(
+    createConfig(),
+    null,
+    createTestLogger(),
+    async () => {
+      const server = createFakeCodexAppServer({
+        initialize: () => new Promise((resolve) => setTimeout(() => resolve({}), 29_000)),
+        "skills/list": () => new Promise(() => {}),
+      });
+      servers.push(server);
+      server.child.once("exit", () => {
+        exits++;
+      });
+      return server.child;
+    },
+    {},
+    false,
+    false,
+    false,
+    undefined,
+    "history",
+  );
+  await session.connect();
+  const outcomes: unknown[] = [];
+  const reads = Array.from({ length: 3 }, () =>
+    session.listCommands().catch((error: unknown) => {
+      outcomes.push(error);
+    }),
+  );
+  try {
+    // Filesystem work before inventory admission uses the real event loop.
+    await vi.waitFor(() => expect(servers).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(60_000);
+    await Promise.all(reads);
+    expect(outcomes).toEqual([
+      new Error("Codex app-server request timed out for skills/list"),
+      new Error("Codex temporary skills read timed out"),
+      new Error("Codex temporary skills read timed out"),
+    ]);
+    expect(servers).toHaveLength(2);
+    expect(exits).toBe(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(servers).toHaveLength(2);
+  } finally {
+    for (const server of servers) server.disconnect();
+    await Promise.all(reads);
+    await session.close();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  }
+});
+
 test("listing commands for a closed Codex agent uses the configured skill inventory", async () => {
   const codex = createReopenableCodexAgent({}, undefined, {
     "skills/list": () => ({
@@ -952,6 +1254,7 @@ test("listing commands for a closed Codex agent uses the configured skill invent
     expect(response.commands.map((command) => command.name)).toContain("compact");
     expect(response.commands.map((command) => command.name)).toContain("configured-skill");
     expect(response.commands.map((command) => command.name)).not.toContain("disabled-skill");
+    expect(codex.appServers).toHaveLength(2);
     expect(codex.liveServers.size).toBe(0);
   } finally {
     await ctx.cleanup();
