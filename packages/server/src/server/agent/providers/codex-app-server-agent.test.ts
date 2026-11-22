@@ -978,7 +978,22 @@ test("failed closed-session skill inventory releases its app-server", async () =
 
 test("restarting a daemon leaves multiple idle Codex sessions closed", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-idle-restart-"));
-  const codex = createReopenableCodexAgent({});
+  const codex = createReopenableCodexAgent({
+    "thread-1": [
+      {
+        id: "turn-1",
+        status: "completed",
+        items: [codexUserItem("user-1", "Remember message 0"), codexAgentItem("Reply 0")],
+      },
+    ],
+    "thread-2": [
+      {
+        id: "turn-2",
+        status: "completed",
+        items: [codexUserItem("user-2", "Remember message 1"), codexAgentItem("Reply 1")],
+      },
+    ],
+  });
   const options = {
     agentClients: { codex: codex.client },
     paseoHomeRoot: dir,
@@ -1005,20 +1020,31 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
     const count = codex.appServers.length;
     ctx = await createDaemonTestContext(options);
     expect(codex.appServers).toHaveLength(count);
-    for (const agentId of ids) {
-      await ctx.client.fetchAgentTimeline(agentId);
+    for (const [index, agentId] of ids.entries()) {
+      const serverCountBeforeRead = codex.appServers.length;
+      const timeline = await ctx.client.fetchAgentTimeline(agentId);
+      if (index < 2) {
+        const entries = timeline.entries.map((entry) => entry.item);
+        expect(entries).toContainEqual(
+          expect.objectContaining({ type: "user_message", text: `Remember message ${index}` }),
+        );
+        expect(entries).toContainEqual(
+          expect.objectContaining({ type: "assistant_message", text: `Reply ${index}` }),
+        );
+      } else {
+        expect(timeline.entries).toEqual([]);
+        expect(codex.appServers).toHaveLength(serverCountBeforeRead);
+      }
       expect(codex.liveServers.size).toBe(0);
     }
-    expect(codex.appServers).toHaveLength(count);
     codex.resetPeak();
-    const listings = await Promise.all(ids.map((agentId) => ctx.client.listCommands({ agentId })));
-    for (const commands of listings) {
+    for (const agentId of ids) {
+      const commands = await ctx.client.listCommands({ agentId });
       expect(commands.error).toBeNull();
       expect(commands.commands.map((command) => command.name)).toContain("compact");
+      expect(codex.liveServers.size).toBe(0);
     }
     expect(codex.liveServers.size).toBe(0);
-    expect(codex.appServers).toHaveLength(count);
-    expect(codex.peak()).toBe(0);
     const beforePrompt = codex.appServers.length;
     const sent = ctx.client.sendMessage(ids[0], "Continue the saved conversation");
     await expect.poll(() => codex.appServers.length).toBe(beforePrompt + 1);
@@ -3045,7 +3071,7 @@ describe("Codex app-server provider", () => {
       provider.resumeSession(archivedThreadHandle(), undefined, undefined, { purpose: "history" }),
     ).rejects.toThrow("thread history is unavailable");
 
-    expect(killSpy).toHaveBeenCalledWith("SIGTERM");
+    expect(killSpy).toHaveBeenCalledWith("SIGKILL");
     appServer.assertNoErrors();
   });
 

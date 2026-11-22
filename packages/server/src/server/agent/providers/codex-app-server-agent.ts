@@ -4407,7 +4407,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     try {
       return await this.readThreadHistory(client);
     } finally {
-      await client.dispose();
+      await client.dispose({ force: true });
     }
   }
 
