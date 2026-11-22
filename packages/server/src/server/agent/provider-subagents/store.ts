@@ -9,6 +9,17 @@ import type {
 
 export type ProviderSubagentStatus = "running" | "completed" | "failed" | "canceled";
 
+export interface ProviderSubagentCompletionEvidence {
+  sourceEventId: string | null;
+  nativeTurnId: string | null;
+  nativeParentId: string | null;
+  role: string | null;
+  sourceEventTime: string | null;
+  provenance: string;
+  outcome: Exclude<ProviderSubagentStatus, "running">;
+  gaps: string[];
+}
+
 export interface ProviderSubagentDescriptor {
   id: string;
   parentAgentId: string;
@@ -23,6 +34,7 @@ export interface ProviderSubagentDescriptor {
   toolCallId: string | null;
   cwd: string | null;
   subtitle: string | null;
+  completionEvidence?: ProviderSubagentCompletionEvidence;
 }
 
 export type ProviderSubagentInputEvent =
@@ -41,6 +53,7 @@ export type ProviderSubagentInputEvent =
       subtitle?: string | null;
       parentSubagentId?: string | null;
       timestamp?: string;
+      completionEvidence?: ProviderSubagentCompletionEvidence;
     }
   | {
       type: "timeline";
@@ -113,6 +126,7 @@ export class ProviderSubagentStore {
       this.timelines.initialize(key);
     }
     const timestamp = event.timestamp ?? new Date().toISOString();
+    const completionEvidence = event.completionEvidence ?? previous?.completionEvidence;
     const subagent: ProviderSubagentDescriptor = {
       id: event.id,
       parentAgentId,
@@ -126,6 +140,7 @@ export class ProviderSubagentStore {
       cwd: stickyField(event.cwd, previous?.cwd),
       subtitle: stickyField(event.subtitle, previous?.subtitle),
       parentSubagentId: stickyField(event.parentSubagentId, previous?.parentSubagentId),
+      ...(completionEvidence ? { completionEvidence } : {}),
     };
     this.descriptors.set(key, subagent);
     return { type: "upsert", subagent };

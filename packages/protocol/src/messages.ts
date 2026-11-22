@@ -5226,6 +5226,18 @@ export const ProviderSubagentDescriptorPayloadSchema = z.object({
   // Compact provider-owned context for the shared track. Providers choose what belongs here and
   // format it for display; clients must not parse provider-specific facts out of this string.
   subtitle: z.string().nullable().optional(),
+  completionEvidence: z
+    .object({
+      sourceEventId: z.string().nullable(),
+      nativeTurnId: z.string().nullable(),
+      nativeParentId: z.string().nullable(),
+      role: z.string().nullable(),
+      sourceEventTime: z.string().nullable(),
+      provenance: z.string(),
+      outcome: z.enum(["completed", "failed", "canceled"]),
+      gaps: z.array(z.string()),
+    })
+    .optional(),
 });
 
 export type ProviderSubagentDescriptorPayload = z.infer<

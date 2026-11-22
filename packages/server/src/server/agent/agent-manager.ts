@@ -115,6 +115,7 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
+import { ProviderSubagentCompletionStore } from "./provider-subagents/completion-store.js";
 import {
   AgentBackgroundWorkStore,
   isDaemonBackgroundWorkItem,
@@ -386,6 +387,7 @@ export interface AgentManagerOptions {
   providerDefinitions?: ProviderEnabledMap;
   idFactory?: () => string;
   registry?: AgentStorage;
+  providerSubagentCompletionStore?: ProviderSubagentCompletionStore;
   onAgentAttention?: AgentAttentionCallback;
   onWorkspaceStateMayHaveChanged?: (params: { cwd: string }) => void;
   timelineStore?: InMemoryAgentTimelineStore;
@@ -861,6 +863,8 @@ export class AgentManager {
   private readonly agents = new Map<string, LiveManagedAgent>();
   private readonly timelineStore: InMemoryAgentTimelineStore;
   private readonly providerSubagents = new ProviderSubagentStore();
+  private readonly providerSubagentCompletionStore?: ProviderSubagentCompletionStore;
+  private readonly restoredProviderSubagentCompletions = new Set<string>();
   private readonly backgroundWork = new AgentBackgroundWorkStore();
   private readonly agentsAwaitingInitialSnapshotPersist = new Set<string>();
   private readonly sessionEventTails = new Map<string, Promise<void>>();
@@ -909,6 +913,7 @@ export class AgentManager {
   private acceptingAgentRegistrations = true;
 
   constructor(options: AgentManagerOptions) {
+    this.providerSubagentCompletionStore = options.providerSubagentCompletionStore;
     this.pluginLifecycle = options.pluginLifecycle;
     this.pluginAgentTools = options.pluginAgentTools;
     this.timelineStore = options.timelineStore ?? new InMemoryAgentTimelineStore();
@@ -1463,6 +1468,41 @@ export class AgentManager {
     return this.providerSubagents.list(parentAgentId);
   }
 
+  private async restoreProviderSubagentCompletions(parentAgentId: string): Promise<void> {
+    const store = this.providerSubagentCompletionStore;
+    if (!store || this.restoredProviderSubagentCompletions.has(parentAgentId)) return;
+    const applyCompletion = (completion: Awaited<ReturnType<typeof store.readAll>>[number]) => {
+      const update = this.providerSubagents.apply(
+        parentAgentId,
+        completion.provider as AgentProvider,
+        {
+          type: "upsert",
+          id: completion.helperId,
+          status: completion.outcome,
+          parentSubagentId: completion.nativeParentId,
+          completionEvidence: {
+            sourceEventId: completion.sourceEventId,
+            nativeTurnId: completion.nativeTurnId,
+            nativeParentId: completion.nativeParentId,
+            role: completion.role,
+            sourceEventTime: completion.sourceEventTime,
+            provenance: completion.provenance,
+            outcome: completion.outcome,
+            gaps: completion.gaps,
+          },
+          ...(completion.sourceEventTime ? { timestamp: completion.sourceEventTime } : {}),
+        },
+      );
+      this.dispatch({ type: "provider_subagent", event: update });
+    };
+    for (const completion of await store.readAll(parentAgentId)) applyCompletion(completion);
+    for (const completion of await store.replay(parentAgentId)) {
+      applyCompletion(completion);
+      await store.acknowledge(parentAgentId, completion.sequence);
+    }
+    this.restoredProviderSubagentCompletions.add(parentAgentId);
+  }
+
   listAgentBackgroundWork(agentId: string): AgentBackgroundWorkItem[] {
     const agent = this.agents.get(agentId);
     if (agent?.internal || (!agent && !this.backgroundWork.summary(agentId))) {
@@ -1775,6 +1815,7 @@ export class AgentManager {
     );
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
+    await this.restoreProviderSubagentCompletions(resolvedAgentId);
     const session = await client.resumeSession(
       handle,
       providerLaunchConfig,
@@ -4891,8 +4932,36 @@ export class AgentManager {
     event: AgentStreamEvent,
   ): Promise<void> {
     if (event.type === "provider_subagent") {
-      const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
+      const completion =
+        event.event.type === "upsert"
+          ? await this.providerSubagentCompletionStore?.append(
+              agent.id,
+              event.provider,
+              event.event,
+            )
+          : null;
+      const update = this.providerSubagents.apply(
+        agent.id,
+        event.provider,
+        completion && event.event.type === "upsert"
+          ? {
+              ...event.event,
+              completionEvidence: {
+                sourceEventId: completion.sourceEventId,
+                nativeTurnId: completion.nativeTurnId,
+                nativeParentId: completion.nativeParentId,
+                role: completion.role,
+                sourceEventTime: completion.sourceEventTime,
+                provenance: completion.provenance,
+                outcome: completion.outcome,
+                gaps: completion.gaps,
+              },
+            }
+          : event.event,
+      );
       this.dispatch({ type: "provider_subagent", event: update });
+      if (completion)
+        await this.providerSubagentCompletionStore?.acknowledge(agent.id, completion.sequence);
       return;
     }
     if (event.type === "background_work") {
@@ -6061,6 +6130,7 @@ export class AgentManager {
    */
   async flush(): Promise<void> {
     await this.flushTasks({ includeAgentRegistrations: false });
+    await this.providerSubagentCompletionStore?.flush();
   }
 
   /**

@@ -5,6 +5,9 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "./agent-manager.js";
+import { AgentStorage } from "./agent-storage.js";
+import { ProviderSubagentCompletionStore } from "./provider-subagents/completion-store.js";
+import { ensureAgentLoaded } from "./agent-loading.js";
 import { AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS } from "./agent-stream-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
@@ -1638,4 +1641,121 @@ describe("target coalesced behavior", () => {
       harness.cleanup();
     }
   });
+});
+
+test("replays a silent provider subagent completion after manager restart", async () => {
+  const root = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "completion-replay-"));
+  const logger = createTestLogger();
+  const client = new TestAgentClient();
+  const storage = new AgentStorage(join(root, "agents"), logger);
+  const completions = new ProviderSubagentCompletionStore(root);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    providerSubagentCompletionStore: completions,
+    logger,
+  });
+  const agentId = AGENT_IDS[0];
+  await manager.createAgent({ provider: "codex", cwd: root }, agentId, { workspaceId: undefined });
+  client.getSession(root).pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: {
+      type: "upsert",
+      id: "helper-1",
+      status: "completed",
+      timestamp: "2026-01-02T03:04:05.000Z",
+    },
+  });
+  client.getSession(root).pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: {
+      type: "upsert",
+      id: "helper-1",
+      status: "completed",
+      timestamp: "2026-01-02T03:04:05.000Z",
+    },
+  });
+  client.getSession(root).pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: { type: "upsert", id: "helper-2", status: "failed" },
+  });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  await storage.flush();
+  expect(manager.listProviderSubagents(agentId)).toMatchObject([
+    { id: "helper-1", status: "completed" },
+    { id: "helper-2", status: "failed", completionEvidence: { sourceEventTime: null } },
+  ]);
+  const journal = await completions.readAll(agentId);
+  expect(journal).toMatchObject([
+    {
+      sequence: 1,
+      helperId: "helper-1",
+      nativeTurnId: null,
+      role: null,
+      sourceEventTime: "2026-01-02T03:04:05.000Z",
+      provenance: "provider-stream",
+      outcome: "completed",
+      gaps: [
+        "native event identity unavailable",
+        "native turn identity unavailable",
+        "helper role unavailable",
+      ],
+    },
+    {
+      helperId: "helper-2",
+      sourceEventTime: null,
+      outcome: "failed",
+      gaps: [
+        "native event identity unavailable",
+        "native turn identity unavailable",
+        "helper role unavailable",
+        "source event time unavailable",
+      ],
+    },
+  ]);
+  expect(journal).toHaveLength(2);
+  expect(await completions.replay(agentId)).toHaveLength(0);
+  await expect(completions.acknowledge(agentId, 99)).rejects.toThrow(
+    "Cannot acknowledge unknown completion",
+  );
+  await manager.closeAgent(agentId);
+  await manager.flush();
+  const crashEvent = {
+    type: "upsert" as const,
+    id: "helper-3",
+    status: "canceled" as const,
+    timestamp: "2026-01-02T03:05:00.000Z",
+  };
+  await completions.append(agentId, "codex", crashEvent);
+  await completions.append(agentId, "codex", crashEvent);
+  expect(await completions.replay(agentId)).toMatchObject([{ helperId: "helper-3" }]);
+  // Model a crash after the durable append and before projection/ack.
+  const restartedStorage = new AgentStorage(join(root, "agents"), logger);
+  const restarted = new AgentManager({
+    clients: { codex: client },
+    registry: restartedStorage,
+    providerSubagentCompletionStore: new ProviderSubagentCompletionStore(root),
+    logger,
+  });
+  await ensureAgentLoaded(agentId, {
+    agentManager: restarted,
+    agentStorage: restartedStorage,
+    logger,
+  });
+  const recovered = restarted.listProviderSubagents(agentId);
+  expect(recovered.map(({ id }) => id)).toEqual(
+    expect.arrayContaining(["helper-1", "helper-2", "helper-3"]),
+  );
+  expect(recovered.find(({ id }) => id === "helper-1")?.status).toBe("completed");
+  expect(recovered.find(({ id }) => id === "helper-2")).toMatchObject({
+    status: "failed",
+    completionEvidence: { sourceEventTime: null },
+  });
+  expect(recovered.find(({ id }) => id === "helper-3")?.status).toBe("canceled");
+  await expect(restartedStorage.get(agentId)).resolves.toMatchObject({ id: agentId });
+  await rmSync(root, { recursive: true, force: true });
 });

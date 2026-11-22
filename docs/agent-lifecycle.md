@@ -206,6 +206,8 @@ Some providers can create their own child sessions inside one provider runtime. 
 
 The provider still owns the underlying runtime. Paseo keeps an agent record so the child can be opened, tracked, archived, and cascaded with the parent, but prompts and history hydration route through the provider adapter for that native child handle.
 
+Terminal provider child updates are journaled under `$PASEO_HOME/provider-subagent-completions.json` before the live projection is updated. The manager replays that journal when reopening the parent and acknowledges each applied sequence. Duplicate terminal deliveries collapse by parent, provider, helper, outcome, and source timestamp. Providers that do not supply a native event ID, turn ID, role, or source time leave those values unknown; the completion record lists the evidence gaps. This is an at-least-once local projection rebuild, not proof that a provider reported every completion. See the [completion journal decision](adr/helper-completions.md).
+
 ## Background visibility
 
 An agent is effectively background when it or its workspace is background:
