@@ -4239,6 +4239,79 @@ describe("Codex app-server provider", () => {
     ]);
   });
 
+  test("keeps sibling terminal evidence on the reporting child", async () => {
+    const session = createSession();
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    await asInternals(session).handleNotification("item/completed", {
+      threadId: "test-thread",
+      item: {
+        type: "collabAgentToolCall",
+        id: "call-siblings",
+        tool: "spawnAgent",
+        status: "completed",
+        prompt: "Report findings.",
+        receiverThreadIds: ["child-a", "child-b"],
+        agentsStates: {
+          "child-a": { status: "running", message: null },
+          "child-b": { status: "running", message: null },
+        },
+      },
+    });
+    events.length = 0;
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-a",
+      turn: { id: "turn-a", status: "failed" },
+    });
+    await asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "child-b",
+      itemId: "message-b",
+      delta: "Still working",
+    });
+    await asInternals(session).handleNotification("turn/completed", {
+      threadId: "child-b",
+      turn: { id: "turn-b", status: "completed" },
+    });
+
+    const terminal = events.flatMap((event) =>
+      event.type === "provider_subagent" &&
+      event.event.type === "upsert" &&
+      event.event.nativeTurnId
+        ? [event.event]
+        : [],
+    );
+    expect(terminal.map(({ id, status, nativeTurnId }) => ({ id, status, nativeTurnId }))).toEqual([
+      { id: "child-a", status: "failed", nativeTurnId: "turn-a" },
+      { id: "child-b", status: "completed", nativeTurnId: "turn-b" },
+    ]);
+    expect(
+      events.flatMap((event) =>
+        event.type === "provider_subagent" && event.event.type === "upsert"
+          ? [{ id: event.event.id, status: event.event.status }]
+          : [],
+      ),
+    ).toEqual([
+      { id: "child-a", status: "failed" },
+      { id: "child-b", status: "running" },
+      { id: "child-b", status: "completed" },
+    ]);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "provider_subagent",
+        event: {
+          type: "timeline",
+          id: "child-b",
+          item: {
+            type: "assistant_message",
+            messageId: "message-b",
+            text: "Still working",
+          },
+        },
+      }),
+    );
+  });
+
   test("keeps child-thread Codex activity out of the parent sub-agent card", async () => {
     const session = createSession();
     const events: AgentStreamEvent[] = [];

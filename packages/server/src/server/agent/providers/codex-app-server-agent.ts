@@ -6619,13 +6619,27 @@ export class CodexAppServerAgentSession implements AgentSession {
   private emitSubAgentActivityUpdate(
     callId: string,
     status?: ToolCallTimelineItem["status"],
-    options?: { reopen?: boolean; subAgentType?: string; nativeTurnId?: string },
+    options?: {
+      reopen?: boolean;
+      subAgentType?: string;
+      nativeTurnId?: string;
+      childThreadId?: string | null;
+    },
   ): void {
     const state = this.subAgentCallsByCallId.get(callId);
     if (!state || state.toolCall.detail.type !== "sub_agent") {
       return;
     }
     let resolvedStatus = status ?? state.toolCall.status;
+    if (options?.childThreadId && state.childThreadIds.size > 1) {
+      this.emitProviderSubagentUpsert(
+        options.childThreadId,
+        state,
+        resolvedStatus,
+        options.nativeTurnId,
+      );
+      return;
+    }
     if (
       status === "running" &&
       !options?.reopen &&
@@ -6832,7 +6846,9 @@ export class CodexAppServerAgentSession implements AgentSession {
             text: parsed.delta,
           });
         }
-        this.emitSubAgentActivityUpdate(subAgentCallId, "running");
+        this.emitSubAgentActivityUpdate(subAgentCallId, "running", {
+          childThreadId: parsed.threadId,
+        });
         return;
       }
       const isFirstDeltaForItem = prev.length === 0;
@@ -6865,7 +6881,9 @@ export class CodexAppServerAgentSession implements AgentSession {
             text: parsed.delta,
           });
         }
-        this.emitSubAgentActivityUpdate(subAgentCallId, "running");
+        this.emitSubAgentActivityUpdate(subAgentCallId, "running", {
+          childThreadId: parsed.threadId,
+        });
         return;
       }
       this.emitEvent({
@@ -6954,6 +6972,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       }
       this.emitSubAgentActivityUpdate(subAgentCallId, status, {
         nativeTurnId: parsed.nativeTurnId,
+        childThreadId: parsed.threadId,
       });
       return;
     }
