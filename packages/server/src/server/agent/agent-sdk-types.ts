@@ -1,4 +1,5 @@
 import type {
+  AgentMetric,
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
@@ -19,6 +20,7 @@ import type {
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type {
+  AgentMetric,
   AgentOptionControl,
   AgentOptionSelectControl,
   AgentOptionToggleControl,
@@ -437,8 +439,12 @@ export type AgentStreamEvent =
       usage?: AgentUsage;
       turnId?: string;
       completionSource?: AgentCompletionSource;
+      /** Shown on the completed turn's footer. */
+      metrics?: AgentMetric[];
     }
   | { type: "usage_updated"; provider: AgentProvider; usage: AgentUsage; turnId?: string }
+  /** Full replacement of the metrics shown for the session. An empty list clears them. */
+  | { type: "session_metrics_updated"; provider: AgentProvider; metrics: AgentMetric[] }
   | {
       type: "mode_changed";
       provider: AgentProvider;
@@ -635,6 +641,8 @@ export interface ImportProviderSessionContext {
 export interface ImportedTimelineEntry {
   item: AgentTimelineItem;
   timestamp?: string;
+  /** Set on the last entry of a turn the provider reported stats for. */
+  turnMetrics?: AgentMetric[];
 }
 
 export interface ImportedProviderSession {
@@ -642,6 +650,7 @@ export interface ImportedProviderSession {
   config: AgentSessionConfig;
   persistence: AgentPersistenceHandle;
   timeline: ImportedTimelineEntry[];
+  sessionMetrics?: AgentMetric[];
   providerSubagentEvents?: Extract<AgentStreamEvent, { type: "provider_subagent" }>[];
 }
 
