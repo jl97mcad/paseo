@@ -79,7 +79,8 @@ Provider checks follow the signals their runtimes expose:
   process starts empty. CLI 2.1.292 or newer is known to support the roster; older binaries must
   demonstrate support by emitting one. Unknown versions stay resident until then.
 - Codex queries background terminals for loaded threads, including native children, and protects
-  pending provider requests. App servers without the terminal-list RPC stay resident.
+  pending provider requests. App servers without the terminal-list RPC stay resident. After the
+  safety check, collection force-kills the process tree before its parent can exit and orphan a child.
 - OpenCode checks active executions and descendants. V1 checks PTYs; v2 also checks shell and
   inbox inventories. The shared server remains leased while a session vetoes collection.
 - Pi checks streaming, compaction, pending replies, and adapter-owned operations. Known native

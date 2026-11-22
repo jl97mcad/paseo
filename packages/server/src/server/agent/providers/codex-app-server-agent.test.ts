@@ -788,12 +788,14 @@ test("collects a Codex agent before its first turn and starts it again on demand
       workspaceId: undefined,
     });
     agentId = agent.id;
+    const stop = vi.spyOn(codex.latestAppServer().child, "kill");
     expect(agent.persistence).toBeNull();
     await codex.manager.appendTimelineItem(agentId, {
       type: "assistant_message",
       text: "Retain this note",
     });
     expect((await cleanup.sweep()).collected.map((entry) => entry.agentId)).toEqual([agentId]);
+    expect(stop).toHaveBeenCalledWith("SIGKILL");
     expect(codex.manager.getAgent(agentId)).toBeNull();
     const reopened = await ensureAgentLoaded(agentId, {
       agentManager: codex.manager,
@@ -944,6 +946,8 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
       server.completeTurn({ threadId: `thread-${i + 1}` });
       await run;
     }
+    const empty = await ctx.client.createAgent({ provider: "codex", cwd: process.cwd() });
+    ids.push(empty.id);
     await ctx.daemon.daemon.agentManager.flush();
     await ctx.cleanup();
     const count = codex.appServers.length;
@@ -969,19 +973,26 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
     resumed.startsTurn({ threadId: "thread-1" });
     resumed.completeTurn({ threadId: "thread-1" });
     await sent;
+    const emptySent = ctx.client.sendMessage(empty.id, "Start the first turn");
+    await expect.poll(() => codex.appServers.length).toBe(count + 2);
+    const firstTurn = codex.latestAppServer();
+    await firstTurn.waitForTurnStart();
+    firstTurn.startsTurn({ threadId: `thread-${count + 2}` });
+    firstTurn.completeTurn({ threadId: `thread-${count + 2}` });
+    await emptySent;
   } finally {
     await ctx.cleanup();
   }
 }, 30_000);
 
-test("closing an app-server stops its descendant process", async () => {
+test("idle shutdown stops a descendant that ignores SIGTERM", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "codex-descendant-"));
   const pidFile = path.join(dir, "child.pid");
+  const descendantScript = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`;
   const script = `
     const { spawn } = require("node:child_process");
-    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-    require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
-    process.on("SIGTERM", () => child.once("exit", () => process.exit(0)));
+    spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], { stdio: "ignore" });
+    process.on("SIGTERM", () => process.exit(0));
     setInterval(() => {}, 1000);
   `;
   const child = spawnProcess(process.execPath, ["-e", script], { stdio: "pipe" });
@@ -989,6 +1000,9 @@ test("closing an app-server stops its descendant process", async () => {
   const alive = (pid: number) => {
     try {
       process.kill(pid, 0);
+      if (process.platform === "linux") {
+        return !readFileSync(`/proc/${pid}/stat`, "utf8").includes(") Z ");
+      }
       return true;
     } catch {
       return false;
@@ -999,7 +1013,7 @@ test("closing an app-server stops its descendant process", async () => {
     descendant = Number(readFileSync(pidFile, "utf8"));
     expect(alive(descendant)).toBe(true);
     const client = new CodexAppServerClient(child, createTestLogger());
-    await client.dispose();
+    await client.dispose({ force: true });
     await expect.poll(() => alive(descendant)).toBe(false);
   } finally {
     if (descendant && alive(descendant)) process.kill(descendant, "SIGKILL");

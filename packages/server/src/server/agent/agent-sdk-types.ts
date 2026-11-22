@@ -757,6 +757,8 @@ export interface AgentSession {
   canDiscardUnpersistedRuntime?(): boolean;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
+  /** Release an idle runtime after its safety checks have passed. */
+  closeIdleRuntime?(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;
   /** A returned model is the effective selection committed by this mutation.
    * Returning void means the requested selection was accepted. No status read is required. */

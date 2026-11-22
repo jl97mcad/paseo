@@ -336,17 +336,20 @@ export class CodexAppServerClient {
     this.child.stdin.write(`${JSON.stringify(payload)}\n`);
   }
 
-  async dispose(): Promise<void> {
+  async dispose(options?: { force?: boolean }): Promise<void> {
     this.disposed = true;
     this.unexpectedTerminationHandler = null;
     this.stdoutLineReader.close();
     this.rejectPending(new Error("Codex app-server client is closed"));
-    try {
-      this.child.stdin.end();
-    } catch {
-      // ignore
+    if (!options?.force) {
+      try {
+        this.child.stdin.end();
+      } catch {
+        // ignore
+      }
     }
     const result = await terminateWithTreeKill(this.child, {
+      gracefulSignal: options?.force ? "SIGKILL" : "SIGTERM",
       gracefulTimeoutMs: APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS,
       forceTimeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS,
       onForceSignal: () => {

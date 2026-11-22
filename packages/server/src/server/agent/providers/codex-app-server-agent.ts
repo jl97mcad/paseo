@@ -5754,7 +5754,11 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
   }
 
-  async close(): Promise<void> {
+  async closeIdleRuntime(): Promise<void> {
+    await this.close({ force: true });
+  }
+
+  async close(options?: { force?: boolean }): Promise<void> {
     this.closed = true;
     this.startupAbort.abort(this.createClosedError());
     this.background.stop();
@@ -5768,7 +5772,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.activeClientMessageId = null;
     this.pendingForegroundTurnIdentification?.resolve(null);
     this.pendingForegroundTurnIdentification = null;
-    await this.disposeClient();
+    await this.disposeClient(options);
     this.currentThreadId = null;
   }
 
@@ -5788,13 +5792,13 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.resolvedPermissionRequests.clear();
   }
 
-  private async disposeClient(): Promise<void> {
+  private async disposeClient(options?: { force?: boolean }): Promise<void> {
     this.background.stop();
     const client = this.client;
     this.connectionState = "disconnected";
     this.currentTurnId = null;
     if (client) {
-      await client.dispose();
+      await client.dispose(options);
     }
     this.client = null;
   }

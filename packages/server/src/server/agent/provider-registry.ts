@@ -477,6 +477,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     interrupt: () => inner.interrupt(),
     stopBackgroundWork: inner.stopBackgroundWork?.bind(inner),
     close: () => inner.close(),
+    closeIdleRuntime: inner.closeIdleRuntime?.bind(inner),
     canStopRuntime: inner.canStopRuntime?.bind(inner),
     canDiscardUnpersistedRuntime: inner.canDiscardUnpersistedRuntime?.bind(inner),
     listCommands: inner.listCommands?.bind(inner),
