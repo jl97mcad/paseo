@@ -8,6 +8,7 @@ export interface RuntimeCleanupCandidate {
   readonly parentAgentId: string | undefined;
   readonly provider: string;
   readonly sessionId: string | null;
+  readonly discardable?: boolean;
   readonly lastActivityAt: number;
   isEligible(): boolean;
   canStopRuntime?(): Promise<boolean>;
@@ -24,7 +25,7 @@ interface Options {
 interface CollectionEntry {
   agentId: string;
   provider: string;
-  sessionId: string;
+  sessionId: string | null;
 }
 interface CollectionResult {
   collected: CollectionEntry[];
@@ -79,7 +80,7 @@ export function createIdleRuntimeCleanup(options: Options) {
     const runtimes = options.runtimes();
     for (const runtime of runtimes) {
       if (!isCurrent()) break;
-      if (!runtime.sessionId) continue;
+      if (!runtime.sessionId && !runtime.discardable) continue;
       const family = familyOf(runtime, runtimes);
       try {
         const allowed = baselineAllows(family) && (await providersAllow(family, isCurrent));

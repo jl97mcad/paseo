@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { type Dirent, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
@@ -102,6 +102,9 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
 import { AgentManager } from "../agent-manager.js";
 import { AgentStorage } from "../agent-storage.js";
+import { createIdleRuntimeCleanup } from "../idle-runtime-cleanup/index.js";
+import { ensureAgentLoaded } from "../agent-loading.js";
+import { createDaemonTestContext } from "../../test-utils/daemon-test-context.js";
 import { buildProviderRegistry } from "../provider-registry.js";
 
 interface CollaborationModeRecord {
@@ -688,15 +691,22 @@ function codexAgentItem(text: string) {
 
 // An AgentManager over a real Codex provider whose every spawn gets a fresh fake
 // app-server serving `threads` from thread/read.
-function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry?: AgentStorage) {
+function createReopenableCodexAgent(
+  threads: Record<string, unknown[]>,
+  registry?: AgentStorage,
+  handlers: Record<string, (params: unknown) => unknown> = {},
+) {
   const appServers: FakeCodexAppServer[] = [];
   const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
     appServerProcess: createFakeCodexAppServerProcess(() => {
+      const nextThreadId = `thread-${appServers.length + 1}`;
       const appServer = createFakeCodexAppServer({
+        "thread/start": () => ({ thread: { id: nextThreadId } }),
         "thread/read": (params) => {
           const { threadId } = params as { threadId: string };
           return { thread: { id: threadId, turns: threads[threadId] ?? [] } };
         },
+        ...handlers,
       });
       appServers.push(appServer);
       return appServer.child;
@@ -715,9 +725,8 @@ function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry
     capabilities: provider.capabilities,
     isAvailable: async () => true,
     fetchCatalog: async () => ({ models: [], modes: [] }),
-    createSession: async () => {
-      throw new Error("Unexpected create");
-    },
+    createSession: (...args) => provider.createSession(...args),
+    listCommandsWithoutSession: (...args) => provider.listCommandsWithoutSession(...args),
     resumeSession: (...args) => provider.resumeSession(...args),
   };
   const manager = new AgentManager({
@@ -736,6 +745,7 @@ function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry
 
   return {
     manager,
+    client,
     agentId,
     handle,
     config,
@@ -760,6 +770,242 @@ function createReopenableCodexAgent(threads: Record<string, unknown[]>, registry
     },
   };
 }
+
+test("collects a Codex agent before its first turn and starts it again on demand", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-idle-empty-"));
+  const storage = new AgentStorage(dir, createTestLogger());
+  const codex = createReopenableCodexAgent({}, storage);
+  const cleanup = createIdleRuntimeCleanup({
+    enabled: true,
+    runtimes: () => codex.manager.getRuntimeCleanupCandidates(),
+    logger: createTestLogger(),
+    now: () => Date.now() + 61 * 60_000,
+    schedule: () => () => {},
+  });
+  let agentId = "";
+  try {
+    const agent = await codex.manager.createAgent(codex.config, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    expect(agent.persistence).toBeNull();
+    await codex.manager.appendTimelineItem(agentId, {
+      type: "assistant_message",
+      text: "Retain this note",
+    });
+    expect((await cleanup.sweep()).collected.map((entry) => entry.agentId)).toEqual([agentId]);
+    expect(codex.manager.getAgent(agentId)).toBeNull();
+    const reopened = await ensureAgentLoaded(agentId, {
+      agentManager: codex.manager,
+      agentStorage: storage,
+      logger: createTestLogger(),
+    });
+    expect(reopened.id).toBe(agentId);
+    expect(codex.manager.getTimeline(agentId)).toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Retain this note" }),
+    );
+    expect(codex.appServers).toHaveLength(2);
+  } finally {
+    await cleanup.close();
+    if (agentId) await codex.manager.closeAgent(agentId);
+    await storage.flush();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("keeps a running Codex turn and resumes its thread after idle collection", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-idle-turn-"));
+  const storage = new AgentStorage(dir, createTestLogger());
+  const codex = createReopenableCodexAgent({}, storage);
+  let now = Date.now() + 61 * 60_000;
+  const cleanup = createIdleRuntimeCleanup({
+    enabled: true,
+    runtimes: () => codex.manager.getRuntimeCleanupCandidates(),
+    logger: createTestLogger(),
+    now: () => now,
+    schedule: () => () => {},
+  });
+  let agentId = "";
+  try {
+    const agent = await codex.manager.createAgent(codex.config, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const run = codex.manager.runAgent(agentId, "Remember this conversation");
+    const server = codex.latestAppServer();
+    await server.waitForTurnStart();
+    server.startsTurn({ threadId: "thread-1" });
+    expect((await cleanup.sweep()).collected).toEqual([]);
+    server.completeTurn();
+    expect((await run).sessionId).toBe("thread-1");
+    await codex.manager.flush();
+    now += 60_000;
+    expect((await cleanup.sweep()).collected).toEqual([]);
+    now += 61 * 60_000;
+    expect((await cleanup.sweep()).collected.map((entry) => entry.agentId)).toEqual([agentId]);
+    expect(codex.manager.getAgent(agentId)).toBeNull();
+    await ensureAgentLoaded(agentId, {
+      agentManager: codex.manager,
+      agentStorage: storage,
+      logger: createTestLogger(),
+    });
+    expect(codex.latestAppServer().requests()).toContainEqual(
+      expect.objectContaining({
+        method: "thread/resume",
+        params: expect.objectContaining({ threadId: "thread-1" }),
+      }),
+    );
+    expect(codex.manager.getAgent(agentId)?.persistence?.sessionId).toBe("thread-1");
+  } finally {
+    await cleanup.close();
+    if (agentId) await codex.manager.closeAgent(agentId);
+    await storage.flush();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("a prompt admitted during the idle probe prevents collection", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-idle-race-"));
+  const storage = new AgentStorage(dir, createTestLogger());
+  const gate = deferred<{ data: string[] }>();
+  const codex = createReopenableCodexAgent({}, storage, {
+    "thread/loaded/list": () => gate.promise,
+  });
+  const cleanup = createIdleRuntimeCleanup({
+    enabled: true,
+    runtimes: () => codex.manager.getRuntimeCleanupCandidates(),
+    logger: createTestLogger(),
+    now: () => Date.now() + 61 * 60_000,
+    schedule: () => () => {},
+  });
+  let agentId = "";
+  try {
+    const agent = await codex.manager.createAgent(codex.config, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    const server = codex.latestAppServer();
+    const collecting = cleanup.sweep();
+    await server.waitForRequest("thread/loaded/list");
+    const run = codex.manager.runAgent(agentId, "Keep working");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    gate.resolve({ data: [] });
+    expect((await collecting).collected).toEqual([]);
+    expect(codex.manager.getAgent(agentId)).not.toBeNull();
+    await server.waitForTurnStart();
+    server.startsTurn({ threadId: "thread-1" });
+    server.completeTurn();
+    await run;
+  } finally {
+    gate.resolve({ data: [] });
+    await cleanup.close();
+    if (agentId) await codex.manager.closeAgent(agentId);
+    await storage.flush();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("listing commands for a closed Codex agent does not reopen its runtime", async () => {
+  const codex = createReopenableCodexAgent({});
+  const ctx = await createDaemonTestContext({ agentClients: { codex: codex.client } });
+  try {
+    const agent = await ctx.client.createAgent({ provider: "codex", cwd: process.cwd() });
+    await ctx.daemon.daemon.agentManager.closeAgent(agent.id);
+    expect(codex.appServers).toHaveLength(1);
+    const response = await ctx.client.listCommands({ agentId: agent.id });
+    expect(response.error).toBeNull();
+    expect(response.commands.map((command) => command.name)).toContain("compact");
+    expect(codex.appServers).toHaveLength(1);
+    expect(ctx.daemon.daemon.agentManager.getAgent(agent.id)).toBeNull();
+  } finally {
+    await ctx.cleanup();
+  }
+}, 30_000);
+
+test("restarting a daemon leaves multiple idle Codex sessions closed", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-idle-restart-"));
+  const codex = createReopenableCodexAgent({});
+  const options = {
+    agentClients: { codex: codex.client },
+    paseoHomeRoot: dir,
+    staticDir: dir,
+    cleanup: false,
+  };
+  let ctx = await createDaemonTestContext(options);
+  try {
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const agent = await ctx.client.createAgent({ provider: "codex", cwd: process.cwd() });
+      ids.push(agent.id);
+      const run = ctx.daemon.daemon.agentManager.runAgent(agent.id, `Remember message ${i}`);
+      const server = codex.latestAppServer();
+      await server.waitForTurnStart();
+      server.startsTurn({ threadId: `thread-${i + 1}` });
+      server.completeTurn({ threadId: `thread-${i + 1}` });
+      await run;
+    }
+    await ctx.daemon.daemon.agentManager.flush();
+    await ctx.cleanup();
+    const count = codex.appServers.length;
+    ctx = await createDaemonTestContext(options);
+    expect(codex.appServers).toHaveLength(count);
+    for (const agentId of ids) {
+      const response = await ctx.client.listCommands({ agentId });
+      expect(response.error).toBeNull();
+      expect(response.commands.map((command) => command.name)).toContain("compact");
+      expect(ctx.daemon.daemon.agentManager.getAgent(agentId)).toBeNull();
+    }
+    expect(codex.appServers).toHaveLength(count);
+    const sent = ctx.client.sendMessage(ids[0], "Continue the saved conversation");
+    await expect.poll(() => codex.appServers.length).toBe(count + 1);
+    const resumed = codex.latestAppServer();
+    await resumed.waitForTurnStart();
+    expect(resumed.requests()).toContainEqual(
+      expect.objectContaining({
+        method: "thread/resume",
+        params: expect.objectContaining({ threadId: "thread-1" }),
+      }),
+    );
+    resumed.startsTurn({ threadId: "thread-1" });
+    resumed.completeTurn({ threadId: "thread-1" });
+    await sent;
+  } finally {
+    await ctx.cleanup();
+  }
+}, 30_000);
+
+test("closing an app-server stops its descendant process", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codex-descendant-"));
+  const pidFile = path.join(dir, "child.pid");
+  const script = `
+    const { spawn } = require("node:child_process");
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+    process.on("SIGTERM", () => child.once("exit", () => process.exit(0)));
+    setInterval(() => {}, 1000);
+  `;
+  const child = spawnProcess(process.execPath, ["-e", script], { stdio: "pipe" });
+  let descendant = 0;
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  try {
+    await expect.poll(() => existsSync(pidFile)).toBe(true);
+    descendant = Number(readFileSync(pidFile, "utf8"));
+    expect(alive(descendant)).toBe(true);
+    const client = new CodexAppServerClient(child, createTestLogger());
+    await client.dispose();
+    await expect.poll(() => alive(descendant)).toBe(false);
+  } finally {
+    if (descendant && alive(descendant)) process.kill(descendant, "SIGKILL");
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+}, 15_000);
 
 function asInternals(session: CodexTestSession): CodexSessionTestAccess {
   return castInternals<CodexSessionTestAccess>(session);

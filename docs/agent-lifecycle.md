@@ -47,8 +47,9 @@ still own an exclusive writer. A close failure retains that runtime for cleanup 
 replacement. Once closure succeeds, a failed resume leaves the durable agent closed and retryable.
 
 Idle resumable runtimes are collected after one hour without activity, checked once a minute.
-Collection releases the process and preserves the agent record, conversation, relationships, and
-provider session. The next prompt resumes that session. Set `agents.idleRuntimeCleanup: false` in
+A provider can also permit collection before it has a persistence handle when recreating its session
+loses no provider work. Collection releases the process and preserves the agent record, conversation,
+relationships, and provider session. The next prompt resumes that session. Set `agents.idleRuntimeCleanup: false` in
 host config to disable automatic collection. The host setting applies immediately; config-file edits
 apply on reload. Disabling invalidates pending safety checks and close admission. A close already
 started finishes. Re-enabling keeps the existing idle timestamps.

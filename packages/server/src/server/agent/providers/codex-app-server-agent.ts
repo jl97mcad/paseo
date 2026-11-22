@@ -5589,6 +5589,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     return this.background.stopItem(id);
   }
 
+  canDiscardUnpersistedRuntime(): boolean {
+    return this.savedThreadId === null;
+  }
+
   async canStopRuntime(): Promise<boolean> {
     // A history session released its app-server once it read the thread, so nothing runs.
     if (this.connectionState === "history-ready") return true;
@@ -5812,25 +5816,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.cachedSkills === null
         ? await listCodexSkills(this.config.cwd, this.codexHome, this.deps.workspaceGitService)
         : [];
-    const builtin: AgentSlashCommand[] = [
-      {
-        name: "compact",
-        description: "Summarize conversation to prevent hitting the context limit",
-        argumentHint: "",
-        kind: "command",
-      },
-    ];
-    if (this.goalsEnabled) {
-      builtin.push({
-        name: "goal",
-        description: "Set, pause, resume, or clear the agent's goal",
-        argumentHint: "[<objective>|pause|resume|clear]",
-        kind: "command",
-      });
-    }
-    return [...builtin, ...appServerSkills, ...fallbackSkills, ...prompts].sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
+    return codexCommands(this.goalsEnabled, [...appServerSkills, ...fallbackSkills, ...prompts]);
   }
 
   tryHandleOutOfBand(
@@ -8054,6 +8040,25 @@ const lookupLatestCodexRelease: LatestReleaseLookup = async ({ executablePath, s
   return tag.replace(/^rust-v/, "");
 };
 
+function codexCommands(goalsEnabled: boolean, commands: AgentSlashCommand[]): AgentSlashCommand[] {
+  const builtin: AgentSlashCommand[] = [
+    {
+      name: "compact",
+      description: "Summarize conversation to prevent hitting the context limit",
+      argumentHint: "",
+      kind: "command",
+    },
+  ];
+  if (goalsEnabled)
+    builtin.push({
+      name: "goal",
+      description: "Set, pause, resume, or clear the agent's goal",
+      argumentHint: "[<objective>|pause|resume|clear]",
+      kind: "command",
+    });
+  return [...builtin, ...commands].sort((a, b) => a.name.localeCompare(b.name));
+}
+
 export class CodexAppServerAgentClient implements AgentClient {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -8100,6 +8105,21 @@ export class CodexAppServerAgentClient implements AgentClient {
     private readonly runtimeSettings?: ProviderRuntimeSettings,
     private readonly deps: CodexAppServerAgentDeps = {},
   ) {}
+
+  async listCommandsWithoutSession(
+    config: AgentSessionConfig,
+    context?: AgentLaunchContext,
+  ): Promise<AgentSlashCommand[]> {
+    const codexHome = resolveCodexHomeDir(
+      buildCodexAppServerEnv(this.runtimeSettings, context?.env),
+    );
+    const [goalsEnabled, skills, prompts] = await Promise.all([
+      this.resolveGoalsEnabled(),
+      listCodexSkills(config.cwd, codexHome, this.deps.workspaceGitService),
+      listCodexCustomPrompts(codexHome),
+    ]);
+    return codexCommands(goalsEnabled, [...skills, ...prompts]);
+  }
 
   private async readInstalledCodex(signal: AbortSignal): Promise<InstalledCodex> {
     const installed = await this.resolveInstalledCommand();

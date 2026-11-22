@@ -753,6 +753,8 @@ export interface AgentSession {
    * An optional additional veto: missing methods use daemon baseline eligibility;
    * implemented checks that reject or return false keep the runtime resident. */
   canStopRuntime?(): Promise<boolean>;
+  /** True only when a session without a persistence handle can be recreated without losing work. */
+  canDiscardUnpersistedRuntime?(): boolean;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;
@@ -894,6 +896,10 @@ export interface AgentClient {
   resolveCreateConfig?(input: ResolveAgentCreateConfigInput): ResolveAgentCreateConfigResult;
   isCreateConfigUnattended?(input: AgentCreateConfigUnattendedInput): boolean;
   listCommands?(config: AgentSessionConfig): Promise<AgentSlashCommand[]>;
+  listCommandsWithoutSession?(
+    config: AgentSessionConfig,
+    context?: AgentLaunchContext,
+  ): Promise<AgentSlashCommand[]>;
   /**
    * The controls of a draft, with the options a session opened from `config` would run with:
    * `config.providerOptions` (defaults already merged in) plus what the provider resolves

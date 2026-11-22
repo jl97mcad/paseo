@@ -122,7 +122,7 @@ import {
   type DaemonBackgroundWorkKey,
 } from "./background-work/index.js";
 import { withTimeout } from "../../utils/promise-timeout.js";
-import { buildSessionConfig, extractAttention } from "../persistence-hooks.js";
+import { buildSessionConfig, extractAttention, extractTimestamps } from "../persistence-hooks.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
@@ -1329,6 +1329,14 @@ export class AgentManager {
     }
   }
 
+  async listClosedAgentCommands(record: StoredAgentRecord): Promise<AgentSlashCommand[] | null> {
+    const client = this.clients.get(record.provider);
+    if (!client?.listCommandsWithoutSession) return null;
+    const config = buildSessionConfig(record, { validProviders: this.getRegisteredProviderIds() });
+    if (!config) return null;
+    return client.listCommandsWithoutSession(config, { env: record.launchEnv });
+  }
+
   async listDraftCommands(config: AgentSessionConfig): Promise<AgentSlashCommand[]> {
     const normalizedConfig = await this.normalizeConfig(config, { resolveDefaultModel: false });
     const client = this.requireClient(normalizedConfig.provider);
@@ -1565,14 +1573,19 @@ export class AgentManager {
             `Agent ${resolvedAgentId} references unavailable provider '${record.provider}'`,
           );
         }
-        return this.createAgentInternal(config, resolvedAgentId, {
-          labels: record.labels,
-          metadata: record.metadata,
-          workspaceId: record.workspaceId,
-          owner: record.owner,
-          background: record.background,
-          env: record.launchEnv,
-        });
+        return this.createAgentInternal(
+          config,
+          resolvedAgentId,
+          {
+            labels: record.labels,
+            metadata: record.metadata,
+            workspaceId: record.workspaceId,
+            owner: record.owner,
+            background: record.background,
+            env: record.launchEnv,
+          },
+          record,
+        );
       }),
     );
   }
@@ -1581,6 +1594,7 @@ export class AgentManager {
     config: AgentSessionConfig,
     resolvedAgentId: string,
     options: CreateAgentOptions,
+    restoringRecord?: StoredAgentRecord,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     config = this.withConvertedOptions(config);
@@ -1603,7 +1617,7 @@ export class AgentManager {
       };
       options = { ...options, env: request.env, metadata: request.metadata ?? options.metadata };
     }
-    await this.deleteAgentState(resolvedAgentId);
+    if (!restoringRecord) await this.deleteAgentState(resolvedAgentId);
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       config,
       resolvedAgentId,
@@ -1644,7 +1658,13 @@ export class AgentManager {
       owner: options.owner,
       background: options.background,
       launchEnv: options.env ? { ...options.env } : undefined,
-      historyPrimed: true,
+      ...(restoringRecord
+        ? {
+            ...extractTimestamps(restoringRecord),
+            attention: extractAttention(restoringRecord),
+            restoring: true,
+          }
+        : { historyPrimed: true }),
     });
     if (!agent.internal) {
       this.pluginLifecycle?.emit("agent.create.after", {
@@ -2132,21 +2152,26 @@ export class AgentManager {
         identity = Object.freeze({ openedAt: Date.now() });
         this.runtimeCleanupIdentities.set(agent.session, identity);
       }
+      const sessionId = agent.persistence?.sessionId ?? null;
+      const discardable = !sessionId && agent.session.canDiscardUnpersistedRuntime?.() === true;
       const isEligible = () =>
         this.agents.get(agent.id) === agent &&
         agent.updatedAt === updatedAt &&
+        (agent.persistence?.sessionId ?? null) === sessionId &&
+        (sessionId !== null || agent.session.canDiscardUnpersistedRuntime?.() === true) &&
         this.runtimeHasNoPendingWork(agent);
       candidates.push({
         identity,
         agentId: agent.id,
         parentAgentId: getParentAgentIdFromLabels(agent.labels) ?? undefined,
         provider: agent.provider,
-        sessionId: agent.persistence?.sessionId ?? null,
+        sessionId,
+        discardable,
         lastActivityAt: Math.max(updatedAt.getTime(), identity.openedAt),
         isEligible,
         canStopRuntime: agent.session.canStopRuntime?.bind(agent.session),
         closeIfEligible: async (revalidate) => {
-          if (!agent.persistence?.sessionId) return false;
+          if (!sessionId && !discardable) return false;
           // Block prompt admission before entering the close lane. A skipped close also
           // releases this barrier, so the waiting prompt keeps the existing runtime.
           this.collectingRuntimes.add(agent.id);

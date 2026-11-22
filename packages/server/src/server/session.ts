@@ -5639,6 +5639,16 @@ export class Session {
     try {
       const existing = this.agentManager.getAgent(agentId);
       const stored = existing ? null : await this.agentStorage.get(agentId);
+      if (!existing && stored && !stored.archivedAt) {
+        const commands = await this.agentManager.listClosedAgentCommands(stored);
+        if (commands) {
+          this.emit({
+            type: "list_commands_response",
+            payload: { agentId, commands: dedupeSlashCommands(commands), error: null, requestId },
+          });
+          return;
+        }
+      }
       const agent =
         existing || (stored && !stored.archivedAt)
           ? await ensureAgentLoaded(agentId, {

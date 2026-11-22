@@ -478,6 +478,7 @@ export function wrapSessionProvider(provider: AgentProvider, inner: AgentSession
     stopBackgroundWork: inner.stopBackgroundWork?.bind(inner),
     close: () => inner.close(),
     canStopRuntime: inner.canStopRuntime?.bind(inner),
+    canDiscardUnpersistedRuntime: inner.canDiscardUnpersistedRuntime?.bind(inner),
     listCommands: inner.listCommands?.bind(inner),
     setModel: inner.setModel?.bind(inner),
     setThinkingOption: inner.setThinkingOption?.bind(inner),
@@ -575,6 +576,17 @@ function wrapClientProvider(
     resolveConfiguredModel: inner.resolveConfiguredModel?.bind(inner),
     isCreateConfigUnattended: inner.isCreateConfigUnattended?.bind(inner),
     effectiveOptions: (own) => withDefaults(own) ?? {},
+    listCommandsWithoutSession: inner.listCommandsWithoutSession
+      ? (config, context) =>
+          inner.listCommandsWithoutSession!(
+            {
+              ...config,
+              provider: inner.provider,
+              providerOptions: withDefaults(config.providerOptions),
+            },
+            context,
+          )
+      : undefined,
     listControls: listControls
       ? async (config) =>
           await listControls({
