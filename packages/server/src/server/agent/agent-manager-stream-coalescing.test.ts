@@ -2277,6 +2277,106 @@ test("MCP consumers replay and ack independently across daemon reload", async ()
   }
 });
 
+test("helper_completions limits agent callers to their own parent and leaves the host client unrestricted", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-authority-"));
+  const logger = createTestLogger();
+  const store = new ProviderSubagentCompletionStore(root);
+  const storage = new AgentStorage(join(root, "agents"), logger);
+  const manager = new AgentManager({ clients: {}, providerSubagentCompletionStore: store, logger });
+  await store.append("parent-a", "codex", { type: "upsert", id: "helper-a", status: "completed" });
+  await store.append("parent-b", "codex", { type: "upsert", id: "helper-b", status: "completed" });
+  const providers = new ProviderSnapshotManager({ logger });
+  const connect = async (callerAgentId?: string) => {
+    const server = await createAgentMcpServer({
+      agentManager: manager,
+      agentStorage: storage,
+      providerSnapshotManager: providers,
+      callerAgentId,
+      logger,
+    });
+    const client = new Client({
+      name: `completion-authority-${callerAgentId ?? "host"}`,
+      version: "1",
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    return { server, client };
+  };
+  const a = await connect("parent-a");
+  const b = await connect("parent-b");
+  const host = await connect();
+  const call = (client: Client, args: Record<string, unknown>) =>
+    client.callTool({ name: "helper_completions", arguments: args });
+  try {
+    // Each agent can use the journal for its own helpers.
+    expect(
+      (await call(a.client, { operation: "replay", parentAgentId: "parent-a", consumer: "mine" }))
+        .structuredContent,
+    ).toMatchObject({ events: [{ helperId: "helper-a" }], gap: null });
+
+    // Neither agent can read, ack, release, accept gaps for, or verify the other's journal.
+    const crossAttempts: Record<string, unknown>[] = [
+      { operation: "replay", parentAgentId: "parent-b", consumer: "mine" },
+      { operation: "acknowledge", parentAgentId: "parent-b", consumer: "mine", sequence: 2 },
+      { operation: "accept_gap", parentAgentId: "parent-b", consumer: "mine", discardedThrough: 0 },
+      { operation: "release", parentAgentId: "parent-b", consumer: "mine" },
+      {
+        operation: "verify",
+        parentAgentId: "parent-b",
+        sequence: 2,
+        outcome: "failed",
+        evidence: "forged",
+      },
+    ];
+    for (const args of crossAttempts) {
+      const result = await call(a.client, args);
+      expect(result.isError, String(args.operation)).toBe(true);
+    }
+    // The rejected calls left parent-b untouched: no consumer registered, no verification added.
+    expect(await store.replay("parent-b", "mine")).toHaveLength(1);
+    expect(await store.replay("parent-b", "other")).toMatchObject([{ helperId: "helper-b" }]);
+    expect(
+      (await call(b.client, { operation: "replay", parentAgentId: "parent-b", consumer: "mine" }))
+        .structuredContent,
+    ).toMatchObject({ events: [{ helperId: "helper-b" }] });
+    expect(
+      (await call(b.client, { operation: "replay", parentAgentId: "parent-a", consumer: "mine" }))
+        .isError,
+    ).toBe(true);
+
+    // The host (top-level) client keeps access to any parent, including verification.
+    expect(
+      (
+        await call(host.client, {
+          operation: "replay",
+          parentAgentId: "parent-a",
+          consumer: "runner",
+        })
+      ).structuredContent,
+    ).toMatchObject({ events: [{ helperId: "helper-a" }] });
+    expect(
+      (
+        await call(host.client, {
+          operation: "verify",
+          parentAgentId: "parent-b",
+          sequence: 2,
+          outcome: "completed",
+          evidence: "checked by runner",
+        })
+      ).isError,
+    ).not.toBe(true);
+  } finally {
+    for (const { client, server } of [a, b, host]) {
+      await client.close();
+      await server.close();
+    }
+    providers.destroy();
+    await manager.flush();
+    await storage.flush();
+  }
+});
+
 test("retention reports replay gaps and never reuses delivery sequences", async () => {
   const root = mkdtempSync(join(tmpdir(), "completion-retention-"));
   const store = new ProviderSubagentCompletionStore(root, 2);

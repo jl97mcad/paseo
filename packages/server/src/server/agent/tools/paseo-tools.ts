@@ -2189,7 +2189,7 @@ function createToolCatalog(
     {
       title: "Helper completions",
       description:
-        "Replay observed helper completions with a named durable consumer, acknowledge individual deliveries, or record a separate verification. Retention gaps require explicit acceptance. This host only.",
+        "Replay observed helper completions with a named durable consumer, acknowledge individual deliveries, or record a separate verification. Retention gaps require explicit acceptance. Agent callers may use only their own agent ID as parentAgentId. This host only.",
       inputSchema: z.discriminatedUnion("operation", [
         z.object({
           operation: z.literal("replay"),
@@ -2223,6 +2223,13 @@ function createToolCatalog(
       ]),
     },
     async (input) => {
+      // Agent-scoped callers own only their own journal, as with heartbeats. The top-level
+      // host client has no caller identity and may act for any parent.
+      if (callerAgentId && input.parentAgentId !== callerAgentId) {
+        throw new PaseoToolInputError(
+          `Helper completions for ${input.parentAgentId} do not belong to caller ${callerAgentId}`,
+        );
+      }
       const store = agentManager.completionEvents();
       let result: unknown;
       switch (input.operation) {
