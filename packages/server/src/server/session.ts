@@ -79,6 +79,7 @@ import {
 } from "./persistence-hooks.js";
 import { ensureAgentLoaded, ensureUnarchivedAgentLoaded } from "./agent/agent-loading.js";
 import {
+  AgentTurnBusyError,
   sendPromptToAgent,
   waitForAgentRunStartWithTimeout,
   unarchiveAgentState,
@@ -9154,7 +9155,7 @@ export class Session {
       });
       let deliveryStatus: "queued" | undefined;
       const send = async (beforeDispatch: () => Promise<void>) => {
-        if (msg.sourceAgentId) {
+        if (msg.sourceAgentId && !msg.idleOnly) {
           await beforeDispatch();
           const receipt = this.agentMessages.enqueue({
             recipientId: agentId,
@@ -9184,6 +9185,14 @@ export class Session {
           agentId,
           prompt,
           messageId: msg.messageId,
+          source: msg.sourceAgentId
+            ? {
+                kind: "agent-message",
+                agentId: msg.sourceAgentId,
+                serverId: msg.sourceAgentServerId,
+              }
+            : undefined,
+          idleOnly: msg.idleOnly,
           activeTurnBehavior: msg.activeTurnBehavior ?? "interrupt",
           sessionMode: msg.sessionMode,
           clearPendingPermissions: true,
@@ -9208,6 +9217,7 @@ export class Session {
               sourceAgentId: msg.sourceAgentId,
               sourceAgentServerId: msg.sourceAgentServerId,
               sessionMode: msg.sessionMode,
+              ...(msg.idleOnly ? { idleOnly: true } : {}),
               activeTurnBehavior:
                 msg.activeTurnBehavior ?? (msg.sourceAgentId ? "steer" : "interrupt"),
             },
@@ -9243,7 +9253,7 @@ export class Session {
           requestId: msg.requestId,
           agentId: resolved.agentId,
           accepted: false,
-          error: errorToFriendlyMessage(error),
+          error: error instanceof AgentTurnBusyError ? "agent_busy" : errorToFriendlyMessage(error),
         },
       });
     }

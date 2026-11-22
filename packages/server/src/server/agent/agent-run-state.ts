@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 
 import { getAgentStreamEventTurnId, type AgentStreamEvent } from "./agent-sdk-types.js";
 
+export class AgentTurnBusyError extends Error {}
+
 export interface ForegroundTurnWaiter {
   turnId: string;
   callback: (event: AgentStreamEvent) => void;

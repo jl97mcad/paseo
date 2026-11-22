@@ -486,6 +486,7 @@ export interface SendMessageOptions {
   sourceAgentServerId?: string;
   sessionMode?: string;
   messageId?: string;
+  idleOnly?: boolean;
   /** Agent sources wait for turn end unless interrupt is explicit. Human sources default to interrupt. */
   activeTurnBehavior?: ActiveTurnBehavior;
   images?: Array<{ data: string; mimeType: string }>;
@@ -4275,6 +4276,12 @@ export class DaemonClient {
     ) {
       throw new Error("Update the Paseo host to send messages with a qualified agent address.");
     }
+    if (
+      options.idleOnly &&
+      this.lastServerInfoMessage?.features?.agentMessageIdleAdmission !== true
+    ) {
+      throw new Error("Update the Paseo host to send messages only when idle.");
+    }
     const requestId = this.createRequestId();
     const messageId = options.messageId ?? crypto.randomUUID();
     const message = SessionInboundMessageSchema.parse({
@@ -4287,6 +4294,7 @@ export class DaemonClient {
       sessionMode: options.sessionMode,
       ...(messageId ? { messageId } : {}),
       activeTurnBehavior: options.activeTurnBehavior,
+      idleOnly: options.idleOnly,
       images: options.images,
       attachments: options.attachments,
     });

@@ -1,3 +1,4 @@
+import { MessageReceipts } from "../message-receipts/index.js";
 import { createIdleRuntimeCleanup } from "./idle-runtime-cleanup/index.js";
 import {
   prepareAgentMessage,
@@ -15740,6 +15741,108 @@ test.each(["turn_completed", "turn_failed", "turn_canceled"] as const)(
     }
   },
 );
+
+test("idle-only admission reserves the turn before writing a receipt", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-idle-admission-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const receipt = deferred<void>();
+  const entered = deferred<void>();
+  const send = (text: string) =>
+    sendPreparedPromptToAgent({
+      agentManager: manager,
+      agentStorage: storage,
+      agentId: agent.id,
+      prompt: text,
+      idleOnly: true,
+      logger,
+      beforeDispatch: async () => {
+        entered.resolve();
+        await receipt.promise;
+      },
+    });
+  try {
+    const first = send("first");
+    await entered.promise;
+    await expect(send("second")).rejects.toBeInstanceOf(AgentTurnBusyError);
+    receipt.resolve();
+    await first;
+    await manager.waitForAgentRunStart(agent.id);
+    expect(session.startPrompts).toEqual(["first"]);
+  } finally {
+    receipt.resolve();
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("idle-only receipt failures preserve retry and crash ambiguity", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-idle-receipt-"));
+  const session = new SteeringTestSession({ provider: "codex", cwd: workdir });
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const directory = join(workdir, "receipts");
+  const receipts = new MessageReceipts(directory);
+  const input = {
+    agentId: agent.id,
+    messageId: "stable",
+    request: { text: "hello" },
+    send: async (beforeDispatch: () => Promise<void>) => {
+      const result = await sendPreparedPromptToAgent({
+        agentManager: manager,
+        agentStorage: storage,
+        agentId: agent.id,
+        prompt: "hello",
+        idleOnly: true,
+        beforeDispatch,
+        logger,
+      });
+      await dispatchStarted(result);
+    },
+  };
+  try {
+    await startAgentRun(manager, agent.id, "busy", logger);
+    await manager.waitForAgentRunStart(agent.id);
+    await expect(receipts.send(input)).rejects.toBeInstanceOf(AgentTurnBusyError);
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await vi.waitFor(() => expect(manager.hasInFlightRun(agent.id)).toBe(false));
+    await receipts.send(input);
+    await new MessageReceipts(directory).send(input);
+    expect(session.startPrompts).toEqual(["busy", "hello"]);
+    const ambiguous = {
+      ...input,
+      messageId: "ambiguous",
+      send: async (beforeDispatch: () => Promise<void>) => {
+        await beforeDispatch();
+        throw new Error("connection lost");
+      },
+    };
+    await expect(receipts.send(ambiguous)).rejects.toThrow("connection lost");
+    await expect(new MessageReceipts(directory).send(ambiguous)).rejects.toThrow(
+      "agent_request_outcome_unknown",
+    );
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
 
 test("an idle-only prompt waits for idle and checks admission before handoff", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-queued-mode-"));

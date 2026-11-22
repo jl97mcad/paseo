@@ -94,6 +94,7 @@ import {
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
 import {
   AgentRunState,
+  AgentTurnBusyError,
   type ForegroundPromptStart,
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
@@ -3198,7 +3199,7 @@ export class AgentManager {
     promptStart?: ForegroundPromptStart;
   }): Promise<string | null> {
     const { agent, agentId, pendingRun, prompt, options, promptStart } = params;
-    if (promptStart?.admit?.() === false) {
+    if (pendingRun.settled || promptStart?.admit?.() === false) {
       this.runs.settleForegroundRun(agentId, pendingRun.token);
       return null;
     }
@@ -3336,6 +3337,22 @@ export class AgentManager {
       logger: this.logger,
     });
     yield* this.streamAgent(agentId, prompt, options, promptStart);
+  }
+
+  async reserveIdleAgentRun(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+    promptStart?: ForegroundPromptStart,
+  ): Promise<{ iterator: AsyncGenerator<AgentStreamEvent>; release: () => void }> {
+    await this.ensureInteractiveSession(agentId);
+    if (this.hasInFlightRun(agentId) || this.collectingRuntimes.has(agentId)) {
+      throw new AgentTurnBusyError(`Agent ${agentId} is running`);
+    }
+    const iterator = this.streamAgent(agentId, prompt, options, promptStart);
+    const pending = this.runs.getPendingRun(agentId);
+    if (!pending) throw new Error(`Agent ${agentId} could not reserve a turn`);
+    return { iterator, release: () => this.runs.settleForegroundRun(agentId, pending.token) };
   }
 
   streamAgent(

@@ -228,6 +228,7 @@ type ScheduleAgentManager = Pick<
   | "getAgent"
   | "reloadAgentSession"
   | "reloadStalePluginSession"
+  | "reserveIdleAgentRun"
   | "tryRunOutOfBand"
   | "hasInFlightRun"
   | "replaceAgentRun"

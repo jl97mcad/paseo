@@ -1524,6 +1524,7 @@ export const SendAgentMessageRequestSchema = z.object({
   sourceAgentServerId: z.string().min(1).optional(),
   sessionMode: z.string().optional(),
   messageId: z.string().optional(), // Client-provided ID for deduplication
+  idleOnly: z.boolean().optional(),
   activeTurnBehavior: ActiveTurnBehaviorSchema.optional(),
   images: z.array(ImageAttachmentSchema).optional(),
   attachments: AgentAttachmentsSchema,
@@ -4178,6 +4179,7 @@ export const ServerInfoStatusPayloadSchema = z
         canonicalSubmittedPrompts: z.boolean().optional(),
         agentMessageProvenance: z.boolean().optional(),
         agentMessageBatching: z.boolean().optional(),
+        agentMessageIdleAdmission: z.boolean().optional(),
         // COMPAT(agentTurnIdentity): accept peers that observed pre-release v0.2.6 through 2027-01-31.
         agentTurnIdentity: z.boolean().optional(),
         // COMPAT(stableProjectIdentity): added in v0.1.109, remove gate after 2027-01-15.

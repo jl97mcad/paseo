@@ -7,7 +7,8 @@ import type { Logger } from "pino";
 
 import type { AgentPromptInput, AgentRunOptions } from "./agent-sdk-types.js";
 import type { AgentManager, ManagedAgent } from "./agent-manager.js";
-import { ForegroundPromptStart } from "./agent-run-state.js";
+import { AgentTurnBusyError, ForegroundPromptStart } from "./agent-run-state.js";
+export { AgentTurnBusyError } from "./agent-run-state.js";
 import type { AgentStorage } from "./agent-storage.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { isStaleProviderSessionError } from "./stale-provider-session-error.js";
@@ -21,6 +22,7 @@ export type AgentRunController = Pick<
   | "tryRunOutOfBand"
   | "hasInFlightRun"
   | "reloadStalePluginSession"
+  | "reserveIdleAgentRun"
   | "replaceAgentRun"
   | "steerOrReplaceActiveTurn"
   | "streamAgent"
@@ -28,10 +30,9 @@ export type AgentRunController = Pick<
   reloadAgentSession(agentId: string): Promise<unknown>;
 };
 
-export class AgentTurnBusyError extends Error {}
-
 export interface StartAgentRunOptions {
   idleOnly?: boolean;
+  prepareIdle?: () => Promise<void>;
   admit?: () => boolean;
   /** Called after selecting the run, before consuming its events. */
   onDispatch?: (disposition: PromptDispatchDisposition) => void;
@@ -109,6 +110,51 @@ async function drainAgentRunIterator(
   }
 }
 
+async function tryDispatchOutOfBand(
+  manager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options: StartAgentRunOptions | undefined,
+): Promise<boolean> {
+  if (options?.idleOnly) return false;
+  const admit = options?.admit;
+  const accepted = await manager.tryRunOutOfBand(
+    agentId,
+    prompt,
+    options?.runOptions,
+    admit
+      ? () => {
+          if (!admit()) throw new Error("Queued agent message was withdrawn");
+        }
+      : undefined,
+  );
+  if (accepted) options?.onDispatch?.("out_of_band");
+  return accepted;
+}
+
+async function reserveIdleRun(
+  manager: AgentRunController,
+  agentId: string,
+  prompt: AgentPromptInput,
+  options: StartAgentRunOptions | undefined,
+  promptStart: ForegroundPromptStart,
+): Promise<Awaited<ReturnType<AgentRunController["reserveIdleAgentRun"]>> | undefined> {
+  if (!options?.idleOnly) return undefined;
+  const reservation = await manager.reserveIdleAgentRun(
+    agentId,
+    prompt,
+    options.runOptions,
+    promptStart,
+  );
+  try {
+    await options.prepareIdle?.();
+    return reservation;
+  } catch (error) {
+    reservation.release();
+    throw error;
+  }
+}
+
 export async function startAgentRun(
   agentManager: AgentRunController,
   agentId: string,
@@ -132,16 +178,10 @@ export async function startAgentRun(
   // Out-of-band commands (e.g. /goal pause) must run WITHOUT canceling an
   // in-flight turn — replaceAgentRun would interrupt the running turn. The
   // intercept lives at this layer so it covers every prompt entrypoint.
-  const admit = options?.admit;
-  const admitCommand = admit
-    ? () => {
-        if (!admit()) throw new Error("Queued agent message was withdrawn");
-      }
-    : undefined;
-  if (await agentManager.tryRunOutOfBand(agentId, prompt, options?.runOptions, admitCommand)) {
-    options?.onDispatch?.("out_of_band");
+  if (await tryDispatchOutOfBand(agentManager, agentId, prompt, options)) {
     return { disposition: "out_of_band" };
   }
+  const admit = options?.admit;
   const promptStart = new ForegroundPromptStart(agentId, admit);
   try {
     try {
@@ -183,9 +223,15 @@ async function startAgentRunInner(
     options?.onDispatch?.("steered");
     return steered;
   }
-  const { iterator, replaced } = steered
-    ? { iterator: steered.iterator, replaced: true }
-    : await startOrReplaceRun(agentManager, agentId, prompt, options, promptStart);
+  const idleReservation = await reserveIdleRun(agentManager, agentId, prompt, options, promptStart);
+  let selected: {
+    iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
+    replaced: boolean;
+  };
+  if (idleReservation) selected = { iterator: idleReservation.iterator, replaced: false };
+  else if (steered) selected = { iterator: steered.iterator, replaced: true };
+  else selected = await startOrReplaceRun(agentManager, agentId, prompt, options, promptStart);
+  const { iterator, replaced } = selected;
   logger.trace(
     {
       agentId,
@@ -195,13 +241,18 @@ async function startAgentRunInner(
     },
     "agent.session.start_stream.iterator_returned",
   );
-  options?.onDispatch?.("turn_started");
+  try {
+    options?.onDispatch?.("turn_started");
+  } catch (error) {
+    idleReservation?.release();
+    throw error;
+  }
   void (async () => {
     try {
       try {
         await drainAgentRunIterator(iterator);
       } catch (error) {
-        if (!isStaleProviderSessionError(error)) throw error;
+        if (options?.idleOnly || !isStaleProviderSessionError(error)) throw error;
         logger.info(
           { agentId, err: error },
           "Provider session went stale; reopening from persistence",
@@ -438,17 +489,19 @@ export async function sendPreparedPromptToAgent(
   if (params.idleOnly && params.agentManager.hasInFlightRun(params.agentId)) {
     throw new AgentTurnBusyError(`Agent ${params.agentId} is running`);
   }
-  if (params.sessionMode) {
-    await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
-  }
-
-  await params.beforeDispatch?.();
+  const prepare = async () => {
+    if (params.sessionMode)
+      await params.agentManager.setAgentMode(params.agentId, params.sessionMode);
+    await params.beforeDispatch?.();
+  };
+  if (!params.idleOnly) await prepare();
   if (!params.idleOnly && params.admit?.() === false) {
     throw new Error("Queued agent message was withdrawn");
   }
   return await startAgentRun(params.agentManager, params.agentId, params.prompt, params.logger, {
     replaceRunning: !params.idleOnly,
     idleOnly: params.idleOnly,
+    prepareIdle: params.idleOnly ? prepare : undefined,
     admit: params.admit,
     onDispatch: params.onDispatch,
     activeTurnBehavior: params.activeTurnBehavior,
