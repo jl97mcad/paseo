@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
@@ -1952,6 +1953,60 @@ test("managed child terminal settlement is durable without a final report", asyn
     outcome: "unknown",
     gaps: expect.arrayContaining(["runtime closed without source terminal report"]),
   });
+});
+
+test("managed terminal settles when its journal append fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "managed-append-failure-"));
+  const logs: string[] = [];
+  const logger = pino({ level: "error" }, { write: (line) => logs.push(line) });
+  const client = new TestAgentClient();
+  let fail = true;
+  const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+    if (fail) throw new Error("journal unavailable");
+    await writeJsonFileAtomic(file, data);
+  });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(root, "agents"), logger),
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+    labels: { [PARENT_AGENT_ID_LABEL]: AGENT_IDS[1] },
+  });
+  const session = client.getSession(root);
+  const stream = manager.streamAgent(AGENT_IDS[0], "work");
+  const started = stream.next();
+  await manager.waitForAgentRunStart(AGENT_IDS[0]);
+  await started;
+  session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "turn-1" });
+  await waitForSessionEventQueue();
+  await expect(stream.next()).resolves.toMatchObject({ value: { type: "turn_completed" } });
+  await expect(stream.next()).resolves.toEqual({ done: true, value: undefined });
+  expect(await store.readAll(AGENT_IDS[1])).toEqual([]);
+  expect(logs.join("")).toContain("Helper observation not durably accepted");
+  expect(logs.join("")).toContain(AGENT_IDS[0]);
+  fail = false;
+  session.pushEvent({ type: "turn_started", provider: "codex", turnId: "later" });
+  session.pushEvent({
+    type: "turn_completed",
+    provider: "codex",
+    turnId: "later",
+    completionSource: { nativeTurnId: "later" },
+  });
+  await waitForSessionEventQueue();
+  await manager.flush();
+  expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[1])).toMatchObject([
+    { nativeTurnId: "later", outcome: "completed" },
+  ]);
+  session.pushEvent({ type: "turn_started", provider: "codex", turnId: "closing" });
+  await waitForSessionEventQueue();
+  fail = true;
+  await expect(manager.closeAgent(AGENT_IDS[0])).resolves.toBeUndefined();
+  expect(logs).toHaveLength(2);
+  fail = false;
+  expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[1])).toHaveLength(1);
 });
 
 test("MCP consumers replay and ack independently across daemon reload", async () => {

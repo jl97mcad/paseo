@@ -1519,40 +1519,54 @@ export class AgentManager {
     if (!store) return;
     const parent = agent.labels[PARENT_AGENT_ID_LABEL];
     if (parent && (event || agent.lifecycle === "running")) {
-      await store.append(
-        parent,
-        agent.provider,
-        {
-          type: "upsert",
-          id: agent.id,
-          status: event
-            ? (
-                {
-                  turn_completed: "completed",
-                  turn_failed: "failed",
-                  turn_canceled: "canceled",
-                } as const
-              )[event.type]
-            : undefined,
-          ...event?.completionSource,
-        },
-        "managed-lifecycle",
-        event ? [] : ["runtime closed without source terminal report"],
-      );
+      await store
+        .append(
+          parent,
+          agent.provider,
+          {
+            type: "upsert",
+            id: agent.id,
+            status: event
+              ? (
+                  {
+                    turn_completed: "completed",
+                    turn_failed: "failed",
+                    turn_canceled: "canceled",
+                  } as const
+                )[event.type]
+              : undefined,
+            ...event?.completionSource,
+          },
+          "managed-lifecycle",
+          event ? [] : ["runtime closed without source terminal report"],
+        )
+        .catch((err: unknown) => {
+          this.logger.error(
+            { err, parentAgentId: parent, helperId: agent.id, eventType: event?.type },
+            "Helper observation not durably accepted",
+          );
+        });
     }
     for (const helper of this.providerSubagents.list(agent.id)) {
       if (helper.status !== "running") continue;
-      await store.append(
-        agent.id,
-        helper.provider,
-        { type: "upsert", id: helper.id, parentSubagentId: helper.parentSubagentId },
-        "daemon-observation",
-        [
-          event
-            ? "parent turn ended without helper terminal report"
-            : "runtime closed without helper terminal report",
-        ],
-      );
+      await store
+        .append(
+          agent.id,
+          helper.provider,
+          { type: "upsert", id: helper.id, parentSubagentId: helper.parentSubagentId },
+          "daemon-observation",
+          [
+            event
+              ? "parent turn ended without helper terminal report"
+              : "runtime closed without helper terminal report",
+          ],
+        )
+        .catch((err: unknown) => {
+          this.logger.error(
+            { err, parentAgentId: agent.id, helperId: helper.id, eventType: event?.type },
+            "Helper observation not durably accepted",
+          );
+        });
     }
   }
 
