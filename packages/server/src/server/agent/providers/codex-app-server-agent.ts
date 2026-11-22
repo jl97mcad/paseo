@@ -3735,6 +3735,7 @@ interface CodexSubAgentCallState {
   pendingCommandOutputDeltas: Map<string, string[]>;
   pendingFileChangeOutputDeltas: Map<string, string[]>;
   childThreadIds: Set<string>;
+  childStatuses: Map<string, ToolCallTimelineItem["status"]>;
 }
 
 function resolveCodexParentSubagentId(
@@ -6448,6 +6449,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         pendingCommandOutputDeltas: new Map<string, string[]>(),
         pendingFileChangeOutputDeltas: new Map<string, string[]>(),
         childThreadIds: new Set<string>(),
+        childStatuses: new Map<string, ToolCallTimelineItem["status"]>(),
       } satisfies CodexSubAgentCallState);
 
     state.toolCall = timelineItem;
@@ -6631,14 +6633,13 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     let resolvedStatus = status ?? state.toolCall.status;
-    if (options?.childThreadId && state.childThreadIds.size > 1) {
-      this.emitProviderSubagentUpsert(
-        options.childThreadId,
-        state,
-        resolvedStatus,
-        options.nativeTurnId,
-      );
-      return;
+    const scopedChildThreadId = state.childThreadIds.size > 1 ? options?.childThreadId : undefined;
+    if (scopedChildThreadId) {
+      const settledStatus = this.emitScopedSubAgentActivityUpdate(state, status, options);
+      if (settledStatus === null) {
+        return;
+      }
+      resolvedStatus = settledStatus;
     }
     if (
       status === "running" &&
@@ -6669,13 +6670,62 @@ export class CodexAppServerAgentSession implements AgentSession {
     // is re-sent only when its status or label changes.
     const cardChanged = !isDeepStrictEqual(nextToolCall, state.toolCall);
     state.toolCall = nextToolCall;
-    for (const childThreadId of state.childThreadIds) {
-      this.emitProviderSubagentUpsert(childThreadId, state, resolvedStatus, options?.nativeTurnId);
+    if (!scopedChildThreadId) {
+      for (const childThreadId of state.childThreadIds) {
+        this.emitProviderSubagentUpsert(
+          childThreadId,
+          state,
+          resolvedStatus,
+          options?.nativeTurnId,
+        );
+      }
     }
-    if (!cardChanged || (state.parentCallId && state.parentCallId !== callId)) {
-      return;
+    this.emitSubAgentCardIfChanged(state, callId, nextToolCall, cardChanged);
+  }
+
+  private emitSubAgentCardIfChanged(
+    state: CodexSubAgentCallState,
+    callId: string,
+    item: ToolCallTimelineItem,
+    changed: boolean,
+  ): void {
+    if (changed && (!state.parentCallId || state.parentCallId === callId)) {
+      this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item });
     }
-    this.emitEvent({ type: "timeline", provider: CODEX_PROVIDER, item: nextToolCall });
+  }
+
+  private emitScopedSubAgentActivityUpdate(
+    state: CodexSubAgentCallState,
+    status: ToolCallTimelineItem["status"] | undefined,
+    options: { reopen?: boolean; nativeTurnId?: string; childThreadId?: string | null } | undefined,
+  ): ToolCallTimelineItem["status"] | null {
+    const childThreadId = options?.childThreadId;
+    if (!childThreadId) return null;
+    const previousStatus = state.childStatuses.get(childThreadId);
+    if (
+      status === "running" &&
+      previousStatus &&
+      isTerminalSubAgentStatus(previousStatus) &&
+      !options?.reopen
+    ) {
+      return null;
+    }
+    const resolvedStatus = status ?? state.toolCall.status;
+    if (isTerminalSubAgentStatus(resolvedStatus)) {
+      state.childStatuses.set(childThreadId, resolvedStatus);
+    }
+    this.emitProviderSubagentUpsert(childThreadId, state, resolvedStatus, options?.nativeTurnId);
+    if (
+      ![...state.childThreadIds].every((id) => {
+        const childStatus = state.childStatuses.get(id);
+        return childStatus !== undefined && isTerminalSubAgentStatus(childStatus);
+      })
+    ) {
+      return null;
+    }
+    if ([...state.childStatuses.values()].includes("failed")) return "failed";
+    if ([...state.childStatuses.values()].includes("canceled")) return "canceled";
+    return "completed";
   }
 
   private emitProviderSubagentUpsert(

@@ -4244,13 +4244,13 @@ describe("Codex app-server provider", () => {
     const events: AgentStreamEvent[] = [];
     session.subscribe((event) => events.push(event));
 
-    await asInternals(session).handleNotification("item/completed", {
+    await asInternals(session).handleNotification("item/started", {
       threadId: "test-thread",
       item: {
         type: "collabAgentToolCall",
         id: "call-siblings",
         tool: "spawnAgent",
-        status: "completed",
+        status: "inProgress",
         prompt: "Report findings.",
         receiverThreadIds: ["child-a", "child-b"],
         agentsStates: {
@@ -4263,6 +4263,12 @@ describe("Codex app-server provider", () => {
     await asInternals(session).handleNotification("turn/completed", {
       threadId: "child-a",
       turn: { id: "turn-a", status: "failed" },
+    });
+    expect(events.filter((event) => event.type === "timeline")).toEqual([]);
+    await asInternals(session).handleNotification("item/agentMessage/delta", {
+      threadId: "child-a",
+      itemId: "late-message-a",
+      delta: "Late update",
     });
     await asInternals(session).handleNotification("item/agentMessage/delta", {
       threadId: "child-b",
@@ -4310,6 +4316,13 @@ describe("Codex app-server provider", () => {
         },
       }),
     );
+    expect(events.filter((event) => event.type === "timeline").map((event) => event.item)).toEqual([
+      expect.objectContaining({
+        type: "tool_call",
+        callId: "call-siblings",
+        status: "failed",
+      }),
+    ]);
   });
 
   test("keeps child-thread Codex activity out of the parent sub-agent card", async () => {
