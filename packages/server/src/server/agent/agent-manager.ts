@@ -207,7 +207,9 @@ async function resolveResumePurpose(
   record: StoredAgentRecord | null,
   requested: AgentResumePurpose | undefined,
   cwd: string,
+  supportsHistory: boolean,
 ): Promise<AgentResumePurpose> {
+  if (requested === "history" && supportsHistory) return "history";
   if (!record) return requested ?? "interactive";
   if (record.archivedAt) return "history";
   if (requested !== "history") return "interactive";
@@ -1551,7 +1553,7 @@ export class AgentManager {
    * from the record as it is when the lane reaches it. A write queued ahead (`setMetadata`,
    * `setLabels`) is in that record; one queued behind applies to the live agent.
    */
-  createAgentFromRecord(agentId: string): Promise<ManagedAgent> {
+  createAgentFromRecord(agentId: string, purpose?: AgentResumePurpose): Promise<ManagedAgent> {
     const resolvedAgentId = validateAgentId(agentId, "createAgentFromRecord");
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(resolvedAgentId, async () => {
@@ -1577,6 +1579,7 @@ export class AgentManager {
             env: record.launchEnv,
           },
           record,
+          purpose,
         );
       }),
     );
@@ -1587,6 +1590,7 @@ export class AgentManager {
     resolvedAgentId: string,
     options: CreateAgentOptions,
     restoringRecord?: StoredAgentRecord,
+    purpose?: AgentResumePurpose,
   ): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     config = this.withConvertedOptions(config);
@@ -1639,7 +1643,11 @@ export class AgentManager {
     const providerLaunchConfig = this.resolveProviderLaunchConfig(launchConfig, launchContext);
     const createOptions = this.buildCreateSessionOptions(options);
     const launchedOptions = this.launchOptionsFor({ client, own: storedConfig.providerOptions });
-    const session = await client.createSession(providerLaunchConfig, launchContext, createOptions);
+    const createHistory = purpose === "history" && client.createHistorySession;
+    const session = createHistory
+      ? await createHistory.call(client, providerLaunchConfig, launchContext, createOptions)
+      : await client.createSession(providerLaunchConfig, launchContext, createOptions);
+    if (createHistory) this.historySessions.add(session);
     await this.requireExternalMcpSupport(session, providerLaunchConfig, launchContext);
     const agent = await this.registerSession(session, storedConfig, resolvedAgentId, {
       launchedOptions,
@@ -1743,7 +1751,13 @@ export class AgentManager {
     // settled before the config is prepared, because a history load reads an archived
     // agent whose working directory may be gone.
     const record = this.registry ? await this.registry.get(resolvedAgentId) : null;
-    const purpose = await resolveResumePurpose(record, resumeOptions?.purpose, mergedConfig.cwd);
+    const client = this.requireClient(handle.provider);
+    const purpose = await resolveResumePurpose(
+      record,
+      resumeOptions?.purpose,
+      mergedConfig.cwd,
+      !!client.createHistorySession,
+    );
     const currentResumeOptions = { purpose } satisfies AgentResumeSessionOptions;
 
     const launchEnv = record?.launchEnv;
@@ -1753,7 +1767,6 @@ export class AgentManager {
       resolvedAgentId,
       { purpose, env: launchEnv },
     );
-    const client = this.requireClient(handle.provider);
     const available = await client.isAvailable();
     if (!available) {
       throw new Error(

@@ -315,6 +315,9 @@ Authoritative timeline catch-up can use a runtime-only `history` resume purpose.
 history session contains only the read results and must release its provider process once replay
 finishes. Codex reads the persisted thread and child histories on a temporary app-server and never
 loads, resumes, or unarchives a native thread, including legacy records whose native archive failed.
+A history read without a native thread starts no app-server. Command discovery for a history
+session queries Codex on a temporary app-server and releases it before returning, so configured
+skills and disabled skills match Codex without keeping an idle writer alive.
 ACP providers spawn the CLI, replay the session through `session/load`, and terminate the process
 before returning. Interactive resume remains responsible for repairing a provider session archived
 outside Paseo while its Paseo agent is active.

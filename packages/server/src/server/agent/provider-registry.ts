@@ -531,6 +531,21 @@ function wrapClientProvider(
           { ...options, configuredModelIds },
         ),
       ),
+    createHistorySession: inner.createHistorySession
+      ? async (config, launchContext, options) =>
+          wrapSessionProvider(
+            provider,
+            await inner.createHistorySession!(
+              {
+                ...config,
+                provider: inner.provider,
+                providerOptions: withDefaults(config.providerOptions),
+              },
+              launchContext,
+              { ...options, configuredModelIds },
+            ),
+          )
+      : undefined,
     resumeSession: async (handle, overrides, launchContext, options) =>
       wrapSessionProvider(
         provider,

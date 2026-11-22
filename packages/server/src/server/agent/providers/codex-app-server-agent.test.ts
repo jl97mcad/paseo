@@ -697,6 +697,8 @@ function createReopenableCodexAgent(
   handlers: Record<string, (params: unknown) => unknown> = {},
 ) {
   const appServers: FakeCodexAppServer[] = [];
+  const liveServers = new Set<FakeCodexAppServer>();
+  let peakLiveServers = 0;
   const provider = new CodexAppServerAgentClient(createTestLogger(), undefined, {
     appServerProcess: createFakeCodexAppServerProcess(() => {
       const nextThreadId = `thread-${appServers.length + 1}`;
@@ -709,6 +711,9 @@ function createReopenableCodexAgent(
         ...handlers,
       });
       appServers.push(appServer);
+      liveServers.add(appServer);
+      peakLiveServers = Math.max(peakLiveServers, liveServers.size);
+      appServer.child.once("exit", () => liveServers.delete(appServer));
       return appServer.child;
     }),
   });
@@ -726,6 +731,7 @@ function createReopenableCodexAgent(
     isAvailable: async () => true,
     fetchCatalog: async () => ({ models: [], modes: [] }),
     createSession: (...args) => provider.createSession(...args),
+    createHistorySession: (...args) => provider.createHistorySession(...args),
     resumeSession: (...args) => provider.resumeSession(...args),
   };
   const manager = new AgentManager({
@@ -749,6 +755,11 @@ function createReopenableCodexAgent(
     handle,
     config,
     appServers,
+    liveServers,
+    resetPeak: () => {
+      peakLiveServers = liveServers.size;
+    },
+    peak: () => peakLiveServers,
     latestAppServer: () => appServers[appServers.length - 1],
     threadMethods: (index: number) =>
       appServers[index]
@@ -941,6 +952,25 @@ test("listing commands for a closed Codex agent uses the configured skill invent
     expect(response.commands.map((command) => command.name)).toContain("compact");
     expect(response.commands.map((command) => command.name)).toContain("configured-skill");
     expect(response.commands.map((command) => command.name)).not.toContain("disabled-skill");
+    expect(codex.liveServers.size).toBe(0);
+  } finally {
+    await ctx.cleanup();
+  }
+}, 30_000);
+
+test("failed closed-session skill inventory releases its app-server", async () => {
+  const codex = createReopenableCodexAgent({}, undefined, {
+    "skills/list": () => {
+      throw new Error("Skill inventory failed");
+    },
+  });
+  const ctx = await createDaemonTestContext({ agentClients: { codex: codex.client } });
+  try {
+    const agent = await ctx.client.createAgent({ provider: "codex", cwd: process.cwd() });
+    await ctx.daemon.daemon.agentManager.closeAgent(agent.id);
+    const response = await ctx.client.listCommands({ agentId: agent.id });
+    expect(response.error).toContain("Skill inventory failed");
+    expect(codex.liveServers.size).toBe(0);
   } finally {
     await ctx.cleanup();
   }
@@ -975,8 +1005,21 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
     const count = codex.appServers.length;
     ctx = await createDaemonTestContext(options);
     expect(codex.appServers).toHaveLength(count);
+    for (const agentId of ids) {
+      await ctx.client.fetchAgentTimeline(agentId);
+      expect(codex.liveServers.size).toBe(0);
+    }
+    codex.resetPeak();
+    const listings = await Promise.all(ids.map((agentId) => ctx.client.listCommands({ agentId })));
+    for (const commands of listings) {
+      expect(commands.error).toBeNull();
+      expect(commands.commands.map((command) => command.name)).toContain("compact");
+    }
+    expect(codex.liveServers.size).toBe(0);
+    expect(codex.peak()).toBe(1);
+    const beforePrompt = codex.appServers.length;
     const sent = ctx.client.sendMessage(ids[0], "Continue the saved conversation");
-    await expect.poll(() => codex.appServers.length).toBe(count + 1);
+    await expect.poll(() => codex.appServers.length).toBe(beforePrompt + 1);
     const resumed = codex.latestAppServer();
     await resumed.waitForTurnStart();
     expect(resumed.requests()).toContainEqual(
@@ -989,11 +1032,11 @@ test("restarting a daemon leaves multiple idle Codex sessions closed", async () 
     resumed.completeTurn({ threadId: "thread-1" });
     await sent;
     const emptySent = ctx.client.sendMessage(empty.id, "Start the first turn");
-    await expect.poll(() => codex.appServers.length).toBe(count + 2);
+    await expect.poll(() => codex.appServers.length).toBe(beforePrompt + 2);
     const firstTurn = codex.latestAppServer();
     await firstTurn.waitForTurnStart();
-    firstTurn.startsTurn({ threadId: `thread-${count + 2}` });
-    firstTurn.completeTurn({ threadId: `thread-${count + 2}` });
+    firstTurn.startsTurn({ threadId: `thread-${beforePrompt + 2}` });
+    firstTurn.completeTurn({ threadId: `thread-${beforePrompt + 2}` });
     await emptySent;
   } finally {
     await ctx.cleanup();

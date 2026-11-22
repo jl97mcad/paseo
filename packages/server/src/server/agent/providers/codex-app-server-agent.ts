@@ -1,3 +1,4 @@
+import pLimit from "p-limit";
 import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
 import { applyProviderOptionsPatch } from "../option-controls.js";
 import { assertChangesAreLive, validateProviderOptions } from "../provider-options.js";
@@ -3753,6 +3754,9 @@ interface ConsumedRootCompaction {
   itemId?: string;
 }
 
+// ponytail: serialize transient inventories; partition by Codex home if command latency becomes material.
+const limitCodexSkillInventory = pLimit(1);
+
 export class CodexAppServerAgentSession implements AgentSession {
   readonly provider = CODEX_PROVIDER;
   readonly capabilities = CODEX_APP_SERVER_CAPABILITIES;
@@ -3989,7 +3993,9 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async establishConnection(): Promise<void> {
     if (this.initialResumePurpose === "history") {
-      this.stagedHistory = await this.readArchivedHistory();
+      this.stagedHistory = this.currentThreadId
+        ? await this.readArchivedHistory()
+        : { timeline: [], providerSubagentEvents: [] };
       this.connectionState = "history-ready";
       return;
     }
@@ -5074,7 +5080,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     if (this.connectionState === "disconnected") {
       await this.connect();
     }
-    if (!this.currentThreadId) {
+    if (!this.currentThreadId && this.connectionState !== "history-ready") {
       await this.ensureThread();
     }
     const info: AgentRuntimeInfo = {
@@ -5805,7 +5811,32 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   async listCommands(): Promise<AgentSlashCommand[]> {
     const prompts = await listCodexCustomPrompts(this.codexHome);
-    if (this.connectionState === "disconnected") {
+    if (this.connectionState === "history-ready") {
+      await limitCodexSkillInventory(async () => {
+        const { client } = await codexAppServerStartup.start({
+          stateDirKey: codexStartupStateDirKey(this.harnessEnvironment),
+          spawn: this.spawnAppServer,
+          createClient: (child) => new CodexAppServerClient(child, this.logger),
+          initializeParams: buildCodexAppServerInitializeParams(),
+          logger: this.logger,
+          signal: this.startupAbort.signal,
+        });
+        try {
+          const response = toObjectRecord(
+            await client.request("skills/list", { cwds: [this.config.cwd] }, 10_000),
+          );
+          const entries = Array.isArray(response?.data) ? response.data : [];
+          this.cachedSkills = enabledCodexSkills(
+            entries.flatMap((entry) => {
+              const skills = toObjectRecord(entry)?.skills;
+              return Array.isArray(skills) ? skills : [];
+            }),
+          );
+        } finally {
+          await client.dispose({ force: true });
+        }
+      });
+    } else if (this.connectionState === "disconnected") {
       await this.connect();
     } else {
       await this.loadSkills();
@@ -8263,6 +8294,23 @@ export class CodexAppServerAgentClient implements AgentClient {
     launchContext?: AgentLaunchContext,
     options?: AgentCreateSessionOptions,
   ): Promise<AgentSession> {
+    return this.createSessionForPurpose(config, launchContext, options, "interactive");
+  }
+
+  async createHistorySession(
+    config: AgentSessionConfig,
+    launchContext?: AgentLaunchContext,
+    options?: AgentCreateSessionOptions,
+  ): Promise<AgentSession> {
+    return this.createSessionForPurpose(config, launchContext, options, "history");
+  }
+
+  private async createSessionForPurpose(
+    config: AgentSessionConfig,
+    launchContext: AgentLaunchContext | undefined,
+    options: AgentCreateSessionOptions | undefined,
+    purpose: "interactive" | "history",
+  ): Promise<AgentSession> {
     if (options?.persistSession === false) {
       this.logger.debug(
         "Codex app-server does not expose an ephemeral-session option; persistSession=false is currently a no-op",
@@ -8289,7 +8337,7 @@ export class CodexAppServerAgentClient implements AgentClient {
       goalsEnabled,
       autoReviewEnabled,
       launchContext?.agentId,
-      "interactive",
+      purpose,
     );
     await session.connect();
     return session;
