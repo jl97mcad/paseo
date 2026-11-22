@@ -1541,6 +1541,7 @@ export class AgentManager {
           event ? [] : ["runtime closed without source terminal report"],
         )
         .catch((err: unknown) => {
+          store.recordFailedAppend(parent, agent.id, "managed-lifecycle");
           this.logger.error(
             { err, parentAgentId: parent, helperId: agent.id, eventType: event?.type },
             "Helper observation not durably accepted",
@@ -1562,6 +1563,7 @@ export class AgentManager {
           ],
         )
         .catch((err: unknown) => {
+          store.recordFailedAppend(agent.id, helper.id, "daemon-observation");
           this.logger.error(
             { err, parentAgentId: agent.id, helperId: helper.id, eventType: event?.type },
             "Helper observation not durably accepted",
@@ -5001,14 +5003,26 @@ export class AgentManager {
     event: AgentStreamEvent,
   ): Promise<void> {
     if (event.type === "provider_subagent") {
-      const completion =
-        event.event.type === "upsert"
-          ? await this.providerSubagentCompletionStore?.append(
-              agent.id,
-              event.provider,
-              event.event,
-            )
-          : null;
+      let completion = null;
+      if (event.event.type === "upsert" && this.providerSubagentCompletionStore) {
+        try {
+          completion = await this.providerSubagentCompletionStore.append(
+            agent.id,
+            event.provider,
+            event.event,
+          );
+        } catch (err) {
+          this.providerSubagentCompletionStore.recordFailedAppend(
+            agent.id,
+            event.event.id,
+            "provider-stream",
+          );
+          this.logger.error(
+            { err, parentAgentId: agent.id, helperId: event.event.id },
+            "Helper observation not durably accepted",
+          );
+        }
+      }
       const update = this.providerSubagents.apply(
         agent.id,
         event.provider,

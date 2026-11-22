@@ -1998,7 +1998,13 @@ test("managed terminal settles when its journal append fails", async () => {
   await waitForSessionEventQueue();
   await manager.flush();
   expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[1])).toMatchObject([
-    { nativeTurnId: "later", outcome: "completed" },
+    {
+      nativeTurnId: "later",
+      outcome: "completed",
+      gaps: expect.arrayContaining([
+        `observation not durably accepted: ${AGENT_IDS[0]} (managed-lifecycle)`,
+      ]),
+    },
   ]);
   session.pushEvent({ type: "turn_started", provider: "codex", turnId: "closing" });
   await waitForSessionEventQueue();
@@ -2007,6 +2013,51 @@ test("managed terminal settles when its journal append fails", async () => {
   expect(logs).toHaveLength(2);
   fail = false;
   expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[1])).toHaveLength(1);
+});
+
+test("provider subagent projection survives a failed journal append", async () => {
+  const root = mkdtempSync(join(tmpdir(), "provider-append-failure-"));
+  const logger = createTestLogger();
+  const client = new TestAgentClient();
+  let fail = true;
+  const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+    if (fail) throw new Error("journal unavailable");
+    await writeJsonFileAtomic(file, data);
+  });
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(root, "agents"), logger),
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+  });
+  client.getSession(root).pushEvent({
+    type: "provider_subagent",
+    provider: "codex",
+    event: { type: "upsert", id: "helper-failed", status: "completed" },
+  });
+  await waitForSessionEventQueue();
+  expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+    { id: "helper-failed", status: "completed" },
+  ]);
+  fail = false;
+  await store.append(AGENT_IDS[0], "codex", {
+    type: "upsert",
+    id: "helper-later",
+    status: "failed",
+  });
+  expect(await store.replay(AGENT_IDS[0], "gap-consumer")).toMatchObject([
+    {
+      helperId: "helper-later",
+      gaps: expect.arrayContaining([
+        "observation not durably accepted: helper-failed (provider-stream)",
+      ]),
+    },
+  ]);
+  await manager.closeAgent(AGENT_IDS[0]);
+  await manager.flush();
 });
 
 test("MCP consumers replay and ack independently across daemon reload", async () => {

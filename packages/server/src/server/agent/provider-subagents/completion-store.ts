@@ -46,6 +46,7 @@ type Journal = z.infer<typeof journalSchema>;
 export class ProviderSubagentCompletionStore {
   private journal: Journal | undefined;
   private pending: Promise<unknown> = Promise.resolve();
+  private readonly failedAppends = new Map<string, string[]>();
   private readonly file: string;
 
   constructor(
@@ -150,6 +151,7 @@ export class ProviderSubagentCompletionStore {
         provenance,
         outcome,
         gaps: [
+          ...(this.failedAppends.get(parentAgentId) ?? []),
           ...missing,
           ...(!identity ? ["deduplication identity unavailable"] : []),
           ...(outcome === "unknown" ? ["terminal outcome unavailable"] : []),
@@ -163,8 +165,15 @@ export class ProviderSubagentCompletionStore {
         nextSequence: completion.sequence + 1,
         events: [...journal.events, completion],
       });
+      this.failedAppends.delete(parentAgentId);
       return completion;
     });
+  }
+
+  recordFailedAppend(parentAgentId: string, helperId: string, provenance: string): void {
+    const gaps = this.failedAppends.get(parentAgentId) ?? [];
+    gaps.push(`observation not durably accepted: ${helperId} (${provenance})`);
+    this.failedAppends.set(parentAgentId, gaps);
   }
 
   readAll(parentAgentId: string): Promise<ProviderSubagentCompletion[]> {
