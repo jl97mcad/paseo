@@ -2572,3 +2572,57 @@ test("host completion replay survives restart, retention and activity across par
     gap: { discardedThrough: 2 },
   });
 });
+
+test("host consumers replay and acknowledge independently of each other and of parent consumers", async () => {
+  const store = new ProviderSubagentCompletionStore(
+    mkdtempSync(join(tmpdir(), "completion-host-")),
+  );
+  for (const parent of ["parent-a", "parent-b"])
+    await store.append(parent, "codex", {
+      type: "upsert",
+      id: `helper-${parent}`,
+      status: "completed",
+    });
+  await store.consumeHost("first", 100);
+  await store.consumeHost("second", 100);
+  await store.consume("parent-a", "first");
+  await store.acknowledgeHost("first", 1);
+  await store.acknowledgeHost("first", 2);
+  expect((await store.consumeHost("first", 100)).events).toEqual([]);
+  expect((await store.consumeHost("second", 100)).events.map((e) => e.sequence)).toEqual([1, 2]);
+  // A parent consumer with the same name is a separate registration.
+  expect((await store.consume("parent-a", "first")).events.map((e) => e.sequence)).toEqual([1]);
+  await store.releaseHost("first");
+  expect((await store.consumeHost("first", 100)).events).toHaveLength(2);
+  expect((await store.consumeHost("second", 100)).events.map((e) => e.sequence)).toEqual([1, 2]);
+});
+
+test("host consumer capacity is separate from parent capacity and trips at 256", async () => {
+  const store = new ProviderSubagentCompletionStore(
+    mkdtempSync(join(tmpdir(), "completion-host-")),
+  );
+  await store.append("parent", "codex", { type: "upsert", id: "helper", status: "completed" });
+  for (let index = 0; index < 256; index++) await store.consumeHost(`host-${index}`, 1);
+  await expect(store.consumeHost("overflow", 1)).rejects.toThrow("consumer limit");
+  await expect(store.acknowledgeHost("overflow", 1)).rejects.toThrow("consumer limit");
+  await expect(store.acceptHostGap("overflow", 0)).rejects.toThrow("consumer limit");
+  // Existing host consumers and the parent pool are unaffected.
+  expect((await store.consumeHost("host-0", 1)).events).toHaveLength(1);
+  await store.consume("parent", "parent-consumer");
+  for (let index = 1; index < 256; index++) await store.consume("parent", `consumer-${index}`);
+  await expect(store.consume("parent", "overflow")).rejects.toThrow("consumer limit");
+  await store.releaseHost("host-0");
+  await store.consumeHost("overflow", 1);
+});
+
+test("an empty parent ID cannot reach host replay through the parent API", async () => {
+  const store = new ProviderSubagentCompletionStore(
+    mkdtempSync(join(tmpdir(), "completion-host-")),
+  );
+  await store.append("parent", "codex", { type: "upsert", id: "helper", status: "completed" });
+  await expect(store.consume("", "consumer")).rejects.toThrow();
+  await expect(store.acknowledge("", 1, "consumer")).rejects.toThrow();
+  await expect(store.acceptGap("", "consumer", 0)).rejects.toThrow();
+  await expect(store.releaseConsumer("", "consumer")).rejects.toThrow();
+  await expect(store.replay("", "consumer")).rejects.toThrow();
+});

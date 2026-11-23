@@ -206,7 +206,7 @@ Some providers can create their own child sessions inside one provider runtime. 
 
 The provider still owns the underlying runtime. Paseo keeps an agent record so the child can be opened, tracked, archived, and cascaded with the parent, but prompts and history hydration route through the provider adapter for that native child handle.
 
-Terminal helper observations are recorded before projection or finish publication. Native event or turn identity, scoped to parent, provider, helper, and provenance, controls deduplication; timestamps do not. The descriptor projection rebuilds from retained known provider completions. Independent named consumers use the `helper_completions` MCP tool to replay and acknowledge observations, including unknown outcomes and retention gaps. Missing source evidence remains unknown. See the [helper completion consumer decision](adr/helper-completion-consumers.md).
+Terminal helper observations are recorded before projection or finish publication. Native event or turn identity, scoped to parent, provider, helper, and provenance, controls deduplication; timestamps do not. The descriptor projection rebuilds from retained known provider completions. Independent named consumers use the `helper_completions` MCP tool to replay and acknowledge observations, including unknown outcomes and retention gaps. Missing source evidence remains unknown. The `host_helper_completions` tool replays across parents for a top-level client. See the [helper completion consumer decision](adr/helper-completion-consumers.md) and, for the registration limits that now apply, [host replay](adr/helper-completion-host-replay.md).
 
 ## Background visibility
 

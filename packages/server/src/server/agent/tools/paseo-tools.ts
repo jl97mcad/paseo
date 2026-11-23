@@ -2261,7 +2261,7 @@ function createToolCatalog(
     {
       title: "Host helper completions",
       description:
-        "Replay retained host observations across parents. History and unobserved events may be missing; retention gaps require explicit acceptance. Top-level host clients only.",
+        "Replay retained host observations across parents. History and unobserved events may be missing; retention gaps require explicit acceptance. Top-level host clients only: the daemon bearer is shared, so omitting callerAgentId reaches this tool; it separates cooperating agents, not a token holder.",
       inputSchema: z.discriminatedUnion("operation", [
         z.object({
           operation: z.literal("replay"),

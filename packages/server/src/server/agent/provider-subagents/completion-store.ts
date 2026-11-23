@@ -42,6 +42,25 @@ const journalSchema = z.object({
 });
 type Journal = z.infer<typeof journalSchema>;
 
+// Host scope is a distinct type, not an empty parent ID: parent IDs must be non-empty, so only the
+// *Host methods can reach a host registration. The serialized key keeps the empty-parent shape.
+type ConsumerScope = { kind: "host" } | { kind: "parent"; parentAgentId: string };
+const HOST_SCOPE: ConsumerScope = { kind: "host" };
+const HOST_KEY_PREFIX = '["",';
+const parentIdSchema = z.string().min(1).max(128);
+
+function parentScope(parentAgentId: string): ConsumerScope {
+  return { kind: "parent", parentAgentId: parentIdSchema.parse(parentAgentId) };
+}
+
+function consumerKey(scope: ConsumerScope, consumer: string): string {
+  return JSON.stringify([scope.kind === "host" ? "" : scope.parentAgentId, consumer]);
+}
+
+function inScope(scope: ConsumerScope, event: { parentAgentId: string }): boolean {
+  return scope.kind === "host" || event.parentAgentId === scope.parentAgentId;
+}
+
 interface FailedAppends {
   gaps: string[];
   omitted: number;
@@ -217,31 +236,56 @@ export class ProviderSubagentCompletionStore {
     );
   }
 
-  private cursor(journal: Journal, parentAgentId: string, consumer: string) {
+  private cursor(journal: Journal, scope: ConsumerScope, consumer: string) {
     z.string().min(1).max(128).parse(consumer);
-    z.string().max(128).parse(parentAgentId);
     return (
-      journal.consumers[JSON.stringify([parentAgentId, consumer])] ?? {
-        through: consumer === "projection" ? (journal.acknowledgedThrough[parentAgentId] ?? 0) : 0,
+      journal.consumers[consumerKey(scope, consumer)] ?? {
+        through:
+          consumer === "projection" && scope.kind === "parent"
+            ? (journal.acknowledgedThrough[scope.parentAgentId] ?? 0)
+            : 0,
         acknowledged: [],
       }
     );
   }
 
-  private consumerLimitReached(journal: Journal, parentAgentId: string): boolean {
-    const host = parentAgentId === "";
+  // Parent and host registrations have separate pools of 256, so host replay cannot be starved by
+  // parent consumers or the reverse.
+  private consumerLimitReached(journal: Journal, scope: ConsumerScope): boolean {
+    const host = scope.kind === "host";
     return (
-      Object.keys(journal.consumers).filter((key) => key.startsWith('["",') === host).length >= 256
+      Object.keys(journal.consumers).filter((key) => key.startsWith(HOST_KEY_PREFIX) === host)
+        .length >= 256
     );
   }
 
-  consume(parentAgentId: string, consumer: string, limit = 10_000) {
+  async consume(parentAgentId: string, consumer: string) {
+    return this.consumeScope(parentScope(parentAgentId), consumer, 10_000);
+  }
+
+  consumeHost(consumer: string, limit: number) {
+    return this.consumeScope(HOST_SCOPE, consumer, z.number().int().min(1).max(100).parse(limit));
+  }
+
+  acknowledgeHost(consumer: string, sequence: number) {
+    return this.acknowledgeScope(HOST_SCOPE, sequence, consumer);
+  }
+
+  acceptHostGap(consumer: string, discardedThrough: number) {
+    return this.acceptGapScope(HOST_SCOPE, consumer, discardedThrough);
+  }
+
+  releaseHost(consumer: string) {
+    return this.releaseScope(HOST_SCOPE, consumer);
+  }
+
+  private consumeScope(scope: ConsumerScope, consumer: string, limit: number) {
     return this.serialize(async () => {
       let journal = await this.load();
-      const cursor = this.cursor(journal, parentAgentId, consumer);
-      const key = JSON.stringify([parentAgentId, consumer]);
+      const cursor = this.cursor(journal, scope, consumer);
+      const key = consumerKey(scope, consumer);
       if (!(key in journal.consumers)) {
-        if (this.consumerLimitReached(journal, parentAgentId))
+        if (this.consumerLimitReached(journal, scope))
           throw new Error("Completion consumer limit reached");
         await this.save({
           ...journal,
@@ -254,7 +298,7 @@ export class ProviderSubagentCompletionStore {
         events: journal.events
           .filter(
             (e) =>
-              (parentAgentId === "" || e.parentAgentId === parentAgentId) &&
+              inScope(scope, e) &&
               e.sequence > cursor.through &&
               !cursor.acknowledged.includes(e.sequence),
           )
@@ -267,50 +311,35 @@ export class ProviderSubagentCompletionStore {
     });
   }
 
-  consumeHost(consumer: string, limit: number) {
-    return this.consume("", consumer, z.number().int().min(1).max(100).parse(limit));
-  }
-
-  acknowledgeHost(consumer: string, sequence: number) {
-    return this.acknowledge("", sequence, consumer);
-  }
-
-  acceptHostGap(consumer: string, discardedThrough: number) {
-    return this.acceptGap("", consumer, discardedThrough);
-  }
-
-  releaseHost(consumer: string) {
-    return this.releaseConsumer("", consumer);
-  }
-
   async replay(parentAgentId: string, consumer = "projection") {
     const batch = await this.consume(parentAgentId, consumer);
     if (batch.gap) throw new Error(`Completion replay gap through ${batch.gap.discardedThrough}`);
     return batch.events;
   }
 
-  acknowledge(parentAgentId: string, sequence: number, consumer = "projection"): Promise<void> {
+  async acknowledge(
+    parentAgentId: string,
+    sequence: number,
+    consumer = "projection",
+  ): Promise<void> {
+    return this.acknowledgeScope(parentScope(parentAgentId), sequence, consumer);
+  }
+
+  private acknowledgeScope(scope: ConsumerScope, sequence: number, consumer: string) {
     return this.serialize(async () => {
       const journal = await this.load();
-      const cursor = this.cursor(journal, parentAgentId, consumer);
+      const cursor = this.cursor(journal, scope, consumer);
       if (sequence <= cursor.through || cursor.acknowledged.includes(sequence)) return;
-      if (
-        !journal.events.some(
-          (e) =>
-            (parentAgentId === "" || e.parentAgentId === parentAgentId) && e.sequence === sequence,
-        )
-      )
+      if (!journal.events.some((e) => inScope(scope, e) && e.sequence === sequence))
         throw new Error(`Cannot acknowledge unknown completion ${sequence}`);
-      const key = JSON.stringify([parentAgentId, consumer]);
-      if (!(key in journal.consumers) && this.consumerLimitReached(journal, parentAgentId))
+      const key = consumerKey(scope, consumer);
+      if (!(key in journal.consumers) && this.consumerLimitReached(journal, scope))
         throw new Error("Completion consumer limit reached");
       const acknowledged = [...cursor.acknowledged, sequence];
       let through = cursor.through;
       for (const event of journal.events.filter(
         (e) =>
-          cursor.through >= journal.discardedThrough &&
-          (parentAgentId === "" || e.parentAgentId === parentAgentId) &&
-          e.sequence > through,
+          cursor.through >= journal.discardedThrough && inScope(scope, e) && e.sequence > through,
       )) {
         if (!acknowledged.includes(event.sequence)) break;
         through = event.sequence;
@@ -327,14 +356,26 @@ export class ProviderSubagentCompletionStore {
     });
   }
 
-  acceptGap(parentAgentId: string, consumer: string, discardedThrough: number): Promise<void> {
+  async acceptGap(
+    parentAgentId: string,
+    consumer: string,
+    discardedThrough: number,
+  ): Promise<void> {
+    return this.acceptGapScope(parentScope(parentAgentId), consumer, discardedThrough);
+  }
+
+  private acceptGapScope(
+    scope: ConsumerScope,
+    consumer: string,
+    discardedThrough: number,
+  ): Promise<void> {
     return this.serialize(async () => {
       const journal = await this.load();
       if (discardedThrough !== journal.discardedThrough)
         throw new Error("Retention boundary changed; replay again");
-      const cursor = this.cursor(journal, parentAgentId, consumer);
-      const key = JSON.stringify([parentAgentId, consumer]);
-      if (!(key in journal.consumers) && this.consumerLimitReached(journal, parentAgentId))
+      const cursor = this.cursor(journal, scope, consumer);
+      const key = consumerKey(scope, consumer);
+      if (!(key in journal.consumers) && this.consumerLimitReached(journal, scope))
         throw new Error("Completion consumer limit reached");
       await this.save({
         ...journal,
@@ -350,11 +391,15 @@ export class ProviderSubagentCompletionStore {
     });
   }
 
-  releaseConsumer(parentAgentId: string, consumer: string): Promise<void> {
+  async releaseConsumer(parentAgentId: string, consumer: string): Promise<void> {
+    return this.releaseScope(parentScope(parentAgentId), consumer);
+  }
+
+  private releaseScope(scope: ConsumerScope, consumer: string): Promise<void> {
     return this.serialize(async () => {
       const journal = await this.load();
       const consumers = { ...journal.consumers };
-      delete consumers[JSON.stringify([parentAgentId, consumer])];
+      delete consumers[consumerKey(scope, consumer)];
       await this.save({ ...journal, events: [...journal.events], consumers });
     });
   }
