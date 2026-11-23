@@ -10,7 +10,7 @@ Replay registers a named host consumer, returns at most 100 unacknowledged event
 
 ## Limits
 
-The consumers ADR's single limit of 256 `(parent, consumer)` registrations no longer holds. Per-parent registrations keep their 256 limit and non-empty parent IDs of at most 128 characters. Host registrations have their own pool of 256, so the journal can hold 512 registrations. Neither pool can exhaust the other. Host scope is a distinct type in the store; the per-parent methods reject an empty parent ID, so only the `*Host` methods reach host registrations. Release retired host consumers to reclaim the pool.
+The consumers ADR's single limit of 256 `(parent, consumer)` registrations no longer holds. Parent-scoped registrations share one journal-wide pool of 256 across all parents, with non-empty parent IDs of at most 128 characters. Host registrations have their own pool of 256, so the journal can hold 512 registrations. Neither pool can exhaust the other. Host scope is a distinct type in the store; the per-parent methods reject an empty parent ID, so only the `*Host` methods reach host registrations. Release retired host consumers to reclaim the pool.
 
 A retained listing is not a historical inventory. Compaction can remove all observations of a parent; observations before journaling, events never delivered by providers, and failed appends with lost failure markers may never appear. A gap is conservative and does not identify what was lost. Neither an empty page nor an archived parent establishes source drain or no loss. Source IDs and times are present only when supplied by the source. The journal's write and crash limitations remain those in the consumers ADR.
 

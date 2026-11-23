@@ -1,6 +1,6 @@
 # Durable helper observations and consumers
 
-Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md).
+Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md). Registration limit superseded by [Host replay for helper observations](helper-completion-host-replay.md#limits).
 
 ## Decision
 
