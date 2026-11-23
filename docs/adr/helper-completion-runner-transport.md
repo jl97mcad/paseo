@@ -17,6 +17,6 @@ A runner consumes `helper_completions` through the existing top-level Agent MCP 
 
 - **Local-credential-only hosts have no path.** The CLI also admits itself with `$PASEO_HOME/local-credential` on WebSocket and `/api/status`. `/mcp/agents` does not accept it, so a runner that holds only that file cannot reach the journal. Accepting it on this route would widen the route's authentication, so it needs an owner decision from whoever owns daemon auth. It was not done here.
 - **No password configured:** the route is open and any local process may call it. That is the existing daemon trust model.
-- **The injected capability token also works without `callerAgentId`.** Dropping the query parameter makes the connection top-level. This is the shared-bearer limit already recorded in the consumers ADR. Per-agent credentials remain a separate change, and nothing here authenticates a per-agent identity.
+- **Agents no longer hold the capability token.** They hold a per-agent token that only works with their own `callerAgentId` ([Caller identity](helper-completion-caller-identity.md)). The capability token and the password remain host credentials.
 - **Failed-write no-loss is unchanged.** The journal still cannot report an observation that was never persisted and whose marker was lost.
 - **Daemon-local.** The runner must reach the daemon that owns the journal. There is no cross-host replay.

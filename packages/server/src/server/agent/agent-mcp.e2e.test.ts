@@ -535,6 +535,113 @@ describe("agent MCP end-to-end (offline)", () => {
     }
   }, 30_000);
 
+  test("injected agent credentials are bound to their own agent and cannot claim a sibling or host authority", async () => {
+    // Synthetic throwaway credentials only: the password and every token live in this test daemon.
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const agentCwd = await mkdtemp(path.join(os.tmpdir(), "paseo-agent-cwd-"));
+    const port = await getAvailablePort();
+    const recorder: LaunchRecorder = { recordedLaunches: [] };
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createMcpRecordingAgentClients(recorder),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        auth: { password: hashDaemonPassword("daemon-secret") },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    const post = (query: string, token: string) =>
+      fetch(`${mcpUrl}${query}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+        },
+        body: "{}",
+      });
+    const injectedToken = (launch: AgentSessionConfig | undefined): string => {
+      const server = launch?.mcpServers?.paseo;
+      const header =
+        server && "headers" in server && server.headers ? server.headers.Authorization : undefined;
+      return String(header).replace(/^Bearer /, "");
+    };
+
+    const clients: McpClient[] = [];
+    const agentIds: string[] = [];
+    try {
+      const host = await createMcpClient(mcpUrl, "daemon-secret");
+      clients.push(host);
+      for (const title of ["Sibling A", "Sibling B"]) {
+        const created = getStructuredContent(
+          await host.callTool({
+            name: "create_agent",
+            args: {
+              cwd: agentCwd,
+              title,
+              provider: "claude/claude-test-model",
+              mode: "bypassPermissions",
+              initialPrompt: "reply with done and stop",
+            },
+          }),
+        );
+        agentIds.push(String(created?.agentId));
+      }
+      const [agentA, agentB] = agentIds;
+      const tokenA = injectedToken(recorder.recordedLaunches[0]);
+      const tokenB = injectedToken(recorder.recordedLaunches[1]);
+      const shared = daemon.agentManager.getMcpAuthToken();
+
+      // Each agent holds its own credential; none holds the daemon-wide capability token.
+      expect(new Set([tokenA, tokenB, shared]).size).toBe(3);
+
+      // An agent's own credential works for its own identity only.
+      expect((await post(`?callerAgentId=${agentA}`, tokenA)).status).not.toBe(401);
+      expect((await post(`?callerAgentId=${agentB}`, tokenA)).status).toBe(401);
+      expect((await post(`?callerAgentId=${agentA}`, tokenB)).status).toBe(401);
+      // Omitting the identity does not claim host authority.
+      expect((await post("", tokenA)).status).toBe(401);
+
+      // The legitimate host path is unchanged: the password with no caller identity.
+      const store = new ProviderSubagentCompletionStore(paseoHome);
+      await store.append(agentB, "codex", { type: "upsert", id: "helper-b", status: "completed" });
+      const hostReplay = await host.callTool({
+        name: "helper_completions",
+        args: { operation: "replay", parentAgentId: agentB, consumer: "runner" },
+      });
+      expect(hostReplay.isError).not.toBe(true);
+      const hostWide = await host.callTool({
+        name: "host_helper_completions",
+        args: { operation: "replay", consumer: "runner" },
+      });
+      expect(hostWide.isError).not.toBe(true);
+
+      // An agent client built from the injected URL and credential reaches only its own journal.
+      const agentClient = await createMcpClient(`${mcpUrl}?callerAgentId=${agentA}`, tokenA);
+      clients.push(agentClient);
+      const own = await agentClient.callTool({
+        name: "helper_completions",
+        args: { operation: "replay", parentAgentId: agentA, consumer: "self" },
+      });
+      expect(own.isError).not.toBe(true);
+    } finally {
+      for (const client of clients) await client.close();
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
+      await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("create_agent auto-injects paseo MCP by default and can be disabled", async () => {
     const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
     const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));

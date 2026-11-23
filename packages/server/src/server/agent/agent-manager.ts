@@ -1,4 +1,5 @@
 import type { AttachedAgentTool, PluginAgentToolsRuntime } from "../plugins/agent-tools.js";
+import { deriveAgentMcpToken } from "./agent-mcp-token.js";
 import { ProviderOptionsValidationError } from "./provider-options.js";
 import type { AgentToolResult } from "@getpaseo/plugin/server";
 import type { RuntimeCleanupCandidate } from "./idle-runtime-cleanup/index.js";
@@ -6606,7 +6607,7 @@ export class AgentManager {
           this.paseoToolsEnabled && isPaseoToolPolicyEnabled(paseoToolPolicy)
             ? this.mcpBaseUrl
             : null,
-        mcpAuthToken: this.mcpAuthToken,
+        mcpAuthToken: this.mcpAuthToken && deriveAgentMcpToken(this.mcpAuthToken, agentId),
       }),
     );
     return { storedConfig, launchConfig, paseoToolPolicy };

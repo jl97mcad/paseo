@@ -1723,14 +1723,22 @@ export async function createPaseoDaemon(
         return;
       }
       // This route is exempt from the global daemon-password middleware, so it
-      // authenticates here using the injected capability token (or a valid
+      // authenticates here using the agent's derived token (or a valid
       // daemon password). Without this, a password-protected daemon would be
       // wide open on its agent control plane.
+      const callerAgentIdRaw = req.query.callerAgentId;
+      let callerAgentId: string | undefined;
+      if (typeof callerAgentIdRaw === "string") {
+        callerAgentId = callerAgentIdRaw;
+      } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
+        callerAgentId = callerAgentIdRaw[0];
+      }
       if (
         !(await isAgentMcpRequestAuthorized({
           password: config.auth?.password,
           capabilityToken: agentMcpAuthToken,
           authorizationHeader: req.header("authorization"),
+          callerAgentId,
         }))
       ) {
         res.status(401).json({ error: "Unauthorized" });
@@ -1762,13 +1770,6 @@ export async function createPaseoDaemon(
             id: null,
           });
           return;
-        }
-        const callerAgentIdRaw = req.query.callerAgentId;
-        let callerAgentId: string | undefined;
-        if (typeof callerAgentIdRaw === "string") {
-          callerAgentId = callerAgentIdRaw;
-        } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
-          callerAgentId = callerAgentIdRaw[0];
         }
         const { server, transport } = await createAgentMcpSession(callerAgentId);
         res.on("close", () => {

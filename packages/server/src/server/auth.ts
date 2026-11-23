@@ -2,6 +2,7 @@ import { compare, hashSync } from "bcryptjs";
 import { timingSafeEqual } from "node:crypto";
 import type { RequestHandler } from "express";
 import { matchesLocalCredential } from "./local-credential.js";
+import { deriveAgentMcpToken } from "./agent/agent-mcp-token.js";
 
 export const DAEMON_PASSWORD_BCRYPT_COST = 12;
 
@@ -130,13 +131,18 @@ export function shouldBypassBearerAuth(method: string, path: string): boolean {
  * from the global daemon-password middleware. Accepts either the per-daemon-run
  * capability token the daemon injects into its own agents' configs and MCP
  * client, or a valid daemon-password bearer (so existing password-authenticated
- * callers keep working). When no daemon password is configured the endpoint is
+ * callers keep working). Agents hold only a per-agent token derived from the
+ * capability token, valid only for the `callerAgentId` it was derived for, so an
+ * agent cannot impersonate a sibling or reach the top-level host tools by
+ * omitting the identity. When no daemon password is configured the endpoint is
  * open, matching the global middleware's behavior.
  */
 export async function isAgentMcpRequestAuthorized(input: {
   password: string | undefined;
   capabilityToken: string | null;
   authorizationHeader: string | undefined;
+  /** Identity declared in `?callerAgentId=`; only the matching per-agent token may assert it. */
+  callerAgentId?: string;
 }): Promise<boolean> {
   if (!input.password) {
     return true;
@@ -149,6 +155,14 @@ export async function isAgentMcpRequestAuthorized(input: {
     const expected = Buffer.from(input.capabilityToken);
     if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
       return true;
+    }
+    if (input.callerAgentId !== undefined) {
+      const agentToken = Buffer.from(
+        deriveAgentMcpToken(input.capabilityToken, input.callerAgentId),
+      );
+      if (provided.length === agentToken.length && timingSafeEqual(provided, agentToken)) {
+        return true;
+      }
     }
   }
   return isBearerTokenValidAsync({ password: input.password, token });
