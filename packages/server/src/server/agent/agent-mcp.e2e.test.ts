@@ -7,11 +7,13 @@ import { describe, expect, test } from "vitest";
 import { experimental_createMCPClient } from "ai";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import pino from "pino";
+import { z } from "zod";
 
 import { withTimeout } from "../../utils/promise-timeout.js";
 import { hashDaemonPassword } from "../auth.js";
 import { createPaseoDaemon, type PaseoDaemonConfig } from "../bootstrap.js";
 import { createTestAgentClients } from "../test-utils/fake-agent-client.js";
+import { ProviderSubagentCompletionStore } from "./provider-subagents/completion-store.js";
 import type {
   AgentClient,
   AgentPersistenceHandle,
@@ -387,6 +389,149 @@ describe("agent MCP end-to-end (offline)", () => {
       await rm(paseoHome, { recursive: true, force: true });
       await rm(staticDir, { recursive: true, force: true });
       await rm(agentCwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("characterization: host client authenticates with the daemon password and consumes helper completions over HTTP", async () => {
+    // Characterization of existing behavior, not a TDD red: it passed before any source change.
+    const paseoHome = await mkdtemp(path.join(os.tmpdir(), "paseo-home-"));
+    const staticDir = await mkdtemp(path.join(os.tmpdir(), "paseo-static-"));
+    const port = await getAvailablePort();
+    // Seed the journal the daemon will read, as a prior provider run would have left it.
+    const seed = new ProviderSubagentCompletionStore(paseoHome);
+    await seed.append("parent", "codex", {
+      type: "upsert",
+      id: "helper-1",
+      status: "completed",
+      sourceEventId: "native-1",
+      nativeTurnId: "turn-1",
+      role: "worker",
+      timestamp: "2026-11-23T10:00:00.000Z",
+    });
+    await seed.append("parent", "codex", { type: "upsert", id: "helper-2", status: "failed" });
+
+    const daemon = await createPaseoDaemon(
+      {
+        listen: `127.0.0.1:${port}`,
+        paseoHome,
+        corsAllowedOrigins: [],
+        hostnames: true,
+        mcpEnabled: true,
+        staticDir,
+        mcpDebug: false,
+        agentClients: createTestAgentClients(),
+        agentStoragePath: path.join(paseoHome, "agents"),
+        auth: { password: hashDaemonPassword("daemon-secret") },
+      },
+      pino({ level: "silent" }),
+    );
+    await daemon.start();
+    const mcpUrl = `http://127.0.0.1:${port}/mcp/agents`;
+    const post = (authorization?: string) =>
+      fetch(mcpUrl, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          ...(authorization ? { authorization } : {}),
+        },
+        body: "{}",
+      });
+    const call = async (client: McpClient, args: StructuredContent) => {
+      const result = await client.callTool({ name: "helper_completions", args });
+      expect(result.isError).not.toBe(true);
+      return getStructuredContent(result);
+    };
+
+    const sequences = (batch: StructuredContent | null): number[] =>
+      z
+        .array(z.object({ sequence: z.number() }))
+        .parse(batch?.events)
+        .map((e) => e.sequence);
+
+    let client: McpClient | null = null;
+    try {
+      // The route stays closed to anything but the capability token or the daemon password.
+      expect((await post()).status).toBe(401);
+      expect((await post("Bearer wrong-secret")).status).toBe(401);
+      // The same-user local credential admits WebSocket clients but not this route, so a host
+      // client that holds only that credential cannot reach the journal.
+      const localCredential = (
+        await readFile(path.join(paseoHome, "local-credential"), "utf8")
+      ).trim();
+      expect((await post(`Bearer ${localCredential}`)).status).toBe(401);
+
+      client = await createMcpClient(mcpUrl, "daemon-secret");
+      const first = await call(client, {
+        operation: "replay",
+        parentAgentId: "parent",
+        consumer: "runner",
+      });
+      expect(first).toMatchObject({
+        gap: null,
+        events: [
+          {
+            sequence: 1,
+            helperId: "helper-1",
+            provider: "codex",
+            outcome: "completed",
+            sourceEventId: "native-1",
+            nativeTurnId: "turn-1",
+            role: "worker",
+            sourceEventTime: "2026-11-23T10:00:00.000Z",
+            provenance: "provider-stream",
+            gaps: [],
+          },
+          {
+            sequence: 2,
+            helperId: "helper-2",
+            outcome: "failed",
+            sourceEventId: null,
+            gaps: expect.arrayContaining(["native event identity unavailable"]),
+          },
+        ],
+      });
+
+      // Acknowledging one delivery leaves the other pending and other consumers untouched.
+      await call(client, {
+        operation: "acknowledge",
+        parentAgentId: "parent",
+        consumer: "runner",
+        sequence: 1,
+      });
+      const runnerAgain = await call(client, {
+        operation: "replay",
+        parentAgentId: "parent",
+        consumer: "runner",
+      });
+      expect(sequences(runnerAgain)).toEqual([2]);
+      const other = await call(client, {
+        operation: "replay",
+        parentAgentId: "parent",
+        consumer: "other-consumer",
+      });
+      expect(sequences(other)).toEqual([1, 2]);
+
+      // Verification is a separate linked entry and leaves the observed completion immutable.
+      expect(
+        await call(client, {
+          operation: "verify",
+          parentAgentId: "parent",
+          sequence: 2,
+          outcome: "unknown",
+          evidence: "runner could not confirm",
+        }),
+      ).toMatchObject({ kind: "verification", verifiesSequence: 2, outcome: "unknown" });
+      expect(await new ProviderSubagentCompletionStore(paseoHome).readAll("parent")).toMatchObject([
+        { outcome: "completed" },
+        { outcome: "failed" },
+        { kind: "verification" },
+      ]);
+    } finally {
+      await client?.close();
+      await daemon.stop();
+      await rm(paseoHome, { recursive: true, force: true });
+      await rm(staticDir, { recursive: true, force: true });
     }
   }, 30_000);
 
