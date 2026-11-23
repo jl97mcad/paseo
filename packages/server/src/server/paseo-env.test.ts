@@ -111,6 +111,34 @@ describe("paseo env contract", () => {
     expect(env[ELECTRON_RUN_AS_NODE]).toBeUndefined();
   });
 
+  describe("daemon password", () => {
+    // Synthetic value; a child holding the real one could present it as the host.
+    const inherited = { PATH: "/usr/bin", PASEO_PASSWORD: "synthetic-daemon-password" };
+
+    test("is not inherited by external processes", () => {
+      expect(createExternalProcessEnv(inherited).PASEO_PASSWORD).toBeUndefined();
+      expect(createExternalCommandProcessEnv("sh", inherited).PASEO_PASSWORD).toBeUndefined();
+      expect(createExternalProcessEnv(inherited).PATH).toBe("/usr/bin");
+    });
+
+    test("is not passed to the self node command", () => {
+      const previous = process.env.PASEO_PASSWORD;
+      process.env.PASEO_PASSWORD = inherited.PASEO_PASSWORD;
+      try {
+        expect(buildSelfNodeCommand(["script.js"]).env.PASEO_PASSWORD).toBeUndefined();
+      } finally {
+        if (previous === undefined) delete process.env.PASEO_PASSWORD;
+        else process.env.PASEO_PASSWORD = previous;
+      }
+    });
+
+    test("is still passed when a caller sets it explicitly", () => {
+      const env = createExternalProcessEnv(inherited, { PASEO_PASSWORD: "synthetic-other-daemon" });
+
+      expect(env.PASEO_PASSWORD).toBe("synthetic-other-daemon");
+    });
+  });
+
   test("does not use user NODE_ENV as Paseo runtime mode", () => {
     expect(resolvePaseoNodeEnv({ NODE_ENV: "development" })).toBeUndefined();
     expect(resolvePaseoNodeEnv({ NODE_ENV: "development", PASEO_NODE_ENV: "production" })).toBe(

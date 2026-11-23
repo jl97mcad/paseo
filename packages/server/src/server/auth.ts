@@ -141,7 +141,7 @@ export async function isAgentMcpRequestAuthorized(input: {
   password: string | undefined;
   capabilityToken: string | null;
   authorizationHeader: string | undefined;
-  /** Identity declared in `?callerAgentId=`; only the matching per-agent token may assert it. */
+  /** Identity declared in `?callerAgentId=`; only the matching per-agent token may assert it. Empty means none. */
   callerAgentId?: string;
 }): Promise<boolean> {
   if (!input.password) {
@@ -156,7 +156,7 @@ export async function isAgentMcpRequestAuthorized(input: {
     if (provided.length === expected.length && timingSafeEqual(provided, expected)) {
       return true;
     }
-    if (input.callerAgentId !== undefined) {
+    if (input.callerAgentId) {
       const agentToken = Buffer.from(
         deriveAgentMcpToken(input.capabilityToken, input.callerAgentId),
       );

@@ -52,6 +52,7 @@ import {
   type ProviderRuntimeSettings,
   type ResolvedProviderLaunch,
 } from "../../provider-launch-config.js";
+import { createExternalProcessEnv } from "../../../paseo-env.js";
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 import {
@@ -2361,11 +2362,12 @@ export class OmpAgentClient implements AgentClient {
     if (!catalog && !config.mcpServers) {
       return;
     }
-    const bridge = await OmpMcpBridge.connect(config.mcpServers, config.cwd, this.logger, {
-      ...process.env,
-      ...this.runtimeSettings?.env,
-      ...launchEnv,
-    });
+    const bridge = await OmpMcpBridge.connect(
+      config.mcpServers,
+      config.cwd,
+      this.logger,
+      createExternalProcessEnv(process.env, this.runtimeSettings?.env ?? {}, launchEnv ?? {}),
+    );
     const router = new OmpHostToolRouter({ runtimeSession, catalog, bridge, logger: this.logger });
     try {
       await router.register();

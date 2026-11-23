@@ -12,6 +12,7 @@ import {
   isBearerTokenValidAsync,
   shouldBypassBearerAuth,
 } from "./auth.js";
+import { deriveAgentMcpToken } from "./agent/agent-mcp-token.js";
 import { resolveSessionAdmission } from "./session-admission-auth.js";
 import {
   deleteLocalCredential,
@@ -124,6 +125,50 @@ describe("agent MCP request authorizer", () => {
         authorizationHeader: "Bearer wrong-token",
       }),
     ).toBe(false);
+  });
+});
+
+describe("agent MCP caller identity", () => {
+  const CAPABILITY_TOKEN = "cap-token-abc123";
+  const authorize = (authorizationHeader: string | undefined, callerAgentId?: string) =>
+    isAgentMcpRequestAuthorized({
+      password: CORRECT_PASSWORD_HASH,
+      capabilityToken: CAPABILITY_TOKEN,
+      authorizationHeader,
+      callerAgentId,
+    });
+  const tokenFor = (agentId: string) => `Bearer ${deriveAgentMcpToken(CAPABILITY_TOKEN, agentId)}`;
+
+  test("accepts an agent token only for the identity it was derived for", async () => {
+    expect(await authorize(tokenFor("agent-a"), "agent-a")).toBe(true);
+    expect(await authorize(tokenFor("agent-a"), "agent-b")).toBe(false);
+  });
+
+  test("rejects an agent token that declares no identity or an empty one", async () => {
+    expect(await authorize(tokenFor("agent-a"))).toBe(false);
+    expect(await authorize(tokenFor("agent-a"), "")).toBe(false);
+    expect(await authorize(tokenFor(""), "")).toBe(false);
+  });
+
+  test("keeps host credentials valid with or without a declared identity", async () => {
+    expect(await authorize(`Bearer ${CAPABILITY_TOKEN}`, "agent-a")).toBe(true);
+    expect(await authorize("Bearer correct-password", "agent-a")).toBe(true);
+    expect(await authorize("Bearer correct-password")).toBe(true);
+    expect(await authorize("Bearer correct-password", "")).toBe(true);
+  });
+
+  test("without a daemon password, any caller may declare any identity or none", async () => {
+    // Recorded behavior, not isolation: the route is open, so callerAgentId is a claim.
+    for (const callerAgentId of [undefined, "", "agent-a", "agent-b"]) {
+      expect(
+        await isAgentMcpRequestAuthorized({
+          password: undefined,
+          capabilityToken: CAPABILITY_TOKEN,
+          authorizationHeader: undefined,
+          callerAgentId,
+        }),
+      ).toBe(true);
+    }
   });
 });
 

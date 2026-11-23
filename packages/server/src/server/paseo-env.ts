@@ -10,6 +10,11 @@ const RUNTIME_CONTROL_ENV_KEYS = [
   "ESBUILD_BINARY_PATH",
 ] as const;
 
+// Daemon host credentials. `/mcp/agents` and the CLI accept the password as host
+// identity, so a child that inherits it can act as the host regardless of its
+// per-agent MCP token. Only an explicit overlay may hand it to a child.
+const DAEMON_CREDENTIAL_ENV_KEYS = ["PASEO_PASSWORD"] as const;
+
 export type PaseoNodeEnv = "development" | "production" | "test";
 export type ProcessEnvRecord = Record<string, string | undefined>;
 export type ExternalProcessEnv = NodeJS.ProcessEnv & Record<string, string>;
@@ -22,7 +27,11 @@ function buildExternalProcessEnv(
   baseEnv: ProcessEnvRecord,
   overlays: ProcessEnvRecord[],
 ): ExternalProcessEnv {
-  const sanitized = Object.assign({}, baseEnv, ...overlays);
+  const inherited = { ...baseEnv };
+  for (const key of DAEMON_CREDENTIAL_ENV_KEYS) {
+    delete inherited[key];
+  }
+  const sanitized = Object.assign(inherited, ...overlays);
   for (const key of RUNTIME_CONTROL_ENV_KEYS) {
     delete sanitized[key];
   }

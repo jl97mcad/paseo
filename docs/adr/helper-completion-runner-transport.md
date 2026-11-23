@@ -4,7 +4,7 @@ Status: accepted. Extends [Durable helper observations and consumers](helper-com
 
 ## Decision
 
-A runner consumes `helper_completions` through the existing top-level Agent MCP endpoint, `POST /mcp/agents` without `callerAgentId`. It authenticates with the daemon password, the host identity the CLI already uses (`PASEO_PASSWORD`), sent as `Authorization: Bearer <password>`. The route already accepts that bearer, and the tool already gives the top-level client authority over any parent. No daemon code, API, schema or credential changes.
+A runner consumes `helper_completions` through the existing top-level Agent MCP endpoint, `POST /mcp/agents` without `callerAgentId`. It authenticates with the daemon password, the host identity the CLI already uses (`PASEO_PASSWORD`; a runner that is itself an agent child no longer inherits it, see [Caller identity](helper-completion-caller-identity.md), so supply it explicitly), sent as `Authorization: Bearer <password>`. The route already accepts that bearer, and the tool already gives the top-level client authority over any parent. No daemon code, API, schema or credential changes.
 
 `packages/server/src/server/agent/agent-mcp.e2e.test.ts` characterizes this existing behavior (it passed without any source change, so it is not a red test) with a real password-protected daemon and an HTTP MCP client. It checks:
 

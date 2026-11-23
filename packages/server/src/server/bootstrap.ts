@@ -1733,6 +1733,9 @@ export async function createPaseoDaemon(
       } else if (Array.isArray(callerAgentIdRaw) && typeof callerAgentIdRaw[0] === "string") {
         callerAgentId = callerAgentIdRaw[0];
       }
+      // `?callerAgentId=` is no declared identity: the authorizer and the tool layer
+      // must both see it as host scope, not one as an identity and one as falsy.
+      callerAgentId ||= undefined;
       if (
         !(await isAgentMcpRequestAuthorized({
           password: config.auth?.password,
