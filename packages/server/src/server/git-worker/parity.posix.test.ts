@@ -35,11 +35,13 @@ describe.skipIf(isPlatform("win32"))("git worker retirement POSIX-only", () => {
 
     // The first git invocation on PATH records its pid and its child's, then
     // waits on the child. Everything after that runs the real git. `set -C`
-    // makes claiming the marker atomic, so only one invocation blocks.
+    // makes claiming the marker atomic, so only one invocation blocks. The
+    // one-time `git --version` probe (0.17 bare-repository discovery) runs
+    // outside runGitCommand and carries no abort signal, so it is not the one.
     await writeFile(
       path.join(binDirectory, "git"),
       `#!/bin/sh
-if (set -C; : > "${markerFile}") 2>/dev/null; then
+if [ "$1" != "--version" ] && (set -C; : > "${markerFile}") 2>/dev/null; then
   echo $$ >> "${pidFile}"
   sleep 10 &
   echo $! >> "${pidFile}"

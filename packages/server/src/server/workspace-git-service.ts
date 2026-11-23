@@ -48,6 +48,7 @@ import { isPathInsideRoot, looksLikeDefiniteWindowsPath } from "../utils/path.js
 import {
   createRunGitCommand,
   runGitCommand,
+  runWithGitCommandPriority,
   type RunGitCommand,
 } from "../utils/run-git-command.js";
 import type { GitProcessPriority } from "../utils/git-process-scheduler.js";
@@ -700,7 +701,6 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     concurrency: WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY,
     rejectOnClear: true,
   });
-  private readonly pendingRefreshes = new Set<Promise<WorkspaceGitRuntimeSnapshot>>();
   private readonly disposeController = new AbortController();
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
@@ -886,14 +886,20 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   ): Promise<ProjectCheckoutLitePayload> {
     this.assertNotDisposed();
     const normalizedCwd = resolve(cwd);
-    const status = await this.deps.getCheckoutStatus(normalizedCwd, {
-      paseoHome: this.paseoHome,
-      worktreesRoot: this.worktreesRoot,
-      logger: this.logger,
-      ...(options?.priority
-        ? { runGitCommand: createRunGitCommand("checkout-read", { priority: options.priority }) }
-        : {}),
-    });
+    const readStatus = () =>
+      this.deps.getCheckoutStatus(normalizedCwd, {
+        paseoHome: this.paseoHome,
+        worktreesRoot: this.worktreesRoot,
+        logger: this.logger,
+        ...(options?.priority
+          ? { runGitCommand: createRunGitCommand("checkout-read", { priority: options.priority }) }
+          : {}),
+      });
+    // A pooled read runs in a worker thread without the runner above; the priority context is
+    // what crosses that boundary.
+    const status = options?.priority
+      ? await runWithGitCommandPriority(options.priority, readStatus)
+      : await readStatus();
     const cached = this.getCachedSnapshot(normalizedCwd);
     if (cached && cached.git.isGit !== status.isGit) {
       // A fresh checkout read discovered a repository transition. Keep the
@@ -3634,7 +3640,13 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           ) {
             return null;
           }
-          return this.refreshSnapshot(target, request, runRefreshGitCommand);
+          // A pooled read runs in a worker thread without this runner; the priority context
+          // is what crosses that boundary, so observation refreshes stay in the background lane.
+          return request.origin === "observation"
+            ? runWithGitCommandPriority("background", () =>
+                this.refreshSnapshot(target, request, runRefreshGitCommand),
+              )
+            : this.refreshSnapshot(target, request, runRefreshGitCommand);
         });
         if (target.folderMissing) {
           failure = null;
