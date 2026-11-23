@@ -6333,7 +6333,9 @@ export class AgentManager {
    */
   async flush(): Promise<void> {
     await this.flushTasks({ includeAgentRegistrations: false });
-    await this.providerSubagentCompletionStore?.flush();
+    await this.providerSubagentCompletionStore?.flush().catch((error) => {
+      this.logger.warn({ err: error }, "Failed to persist helper completion coverage during flush");
+    });
   }
 
   /**

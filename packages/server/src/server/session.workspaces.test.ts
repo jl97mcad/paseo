@@ -37,6 +37,7 @@ import { createTerminalManager } from "../terminal/terminal-manager.js";
 import { AgentManager, type AgentManagerEvent, type ManagedAgent } from "./agent/agent-manager.js";
 import type { ProviderSubagentDescriptor } from "./agent/provider-subagents/store.js";
 import { AgentStorage, type StoredAgentRecord } from "./agent/agent-storage.js";
+import { ProviderSubagentCompletionStore } from "./agent/provider-subagents/completion-store.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
@@ -1257,6 +1258,63 @@ test("create_agent_request launches from an exact subdirectory in a created work
     });
   } finally {
     rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("delete_agent_request removes storage when completion coverage persistence fails", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "completion-delete-"));
+  const logs: string[] = [];
+  const logger = pino({ level: "warn" }, { write: (line) => logs.push(line) });
+  const storage = new AgentStorage(path.join(root, "agents"), logger);
+  const store = new ProviderSubagentCompletionStore(root, 10000, async () => {
+    throw new Error("journal unavailable");
+  });
+  const manager = new AgentManager({
+    clients: { codex: new CreateAgentTestClient() },
+    registry: storage,
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  const agentId = "00000000-0000-4000-8000-000000000553";
+  const messages: SessionOutboundMessage[] = [];
+  try {
+    await manager.createAgent({ provider: "codex", cwd: root }, agentId, {
+      workspaceId: undefined,
+    });
+    await manager.flush();
+    await storage.flush();
+    expect(await storage.get(agentId)).toMatchObject({ id: agentId });
+    store.recordFailedAppend(agentId, "helper", "provider-stream");
+    await expect(store.flush()).rejects.toThrow("journal unavailable");
+    const session = createSessionForWorkspaceTests({
+      onMessage: (message) => messages.push(message),
+      agentManager: {
+        getAgent: manager.getAgent.bind(manager),
+        closeAgent: manager.closeAgent.bind(manager),
+        flush: manager.flush.bind(manager),
+        deleteAgentState: manager.deleteAgentState.bind(manager),
+        notifyAgentRemoved: manager.notifyAgentRemoved.bind(manager),
+      },
+      agentStorage: {
+        get: storage.get.bind(storage),
+        beginDelete: storage.beginDelete.bind(storage),
+        remove: storage.remove.bind(storage),
+      },
+    });
+    await session.handleMessage({ type: "delete_agent_request", agentId, requestId: "delete" });
+    expect(messages).toEqual([
+      { type: "agent_deleted", payload: { agentId, requestId: "delete" } },
+    ]);
+    expect(manager.getAgent(agentId)).toBeNull();
+    expect(await new AgentStorage(path.join(root, "agents"), logger).get(agentId)).toBeNull();
+    expect(logs.join("")).toContain("Failed to persist helper completion coverage during flush");
+    await expect(manager.flushForShutdown()).resolves.toBeUndefined();
+    expect(logs.join("")).toContain("Failed to persist helper completion coverage at shutdown");
+  } finally {
+    await manager.closeAgent(agentId);
+    await manager.flushForShutdown();
+    await storage.flush();
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

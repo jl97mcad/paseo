@@ -1,6 +1,6 @@
 # Durable helper observations and consumers
 
-Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md). Registration limit superseded by [Host replay for helper observations](helper-completion-host-replay.md#limits).
+Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md). Registration limit superseded by [Host replay for helper observations](helper-completion-host-replay.md#limits). Replay results and the process-lifetime overflow and later-observation-only failure warning statements are superseded by [Helper completion coverage warning](helper-completion-coverage.md).
 
 ## Decision
 
@@ -14,13 +14,13 @@ Completion evidence remains immutable. A verification is another journal entry l
 
 The local MCP tool `helper_completions` takes `parentAgentId` and an operation:
 
-| Operation     | Other arguments                   | Result                                         |
-| ------------- | --------------------------------- | ---------------------------------------------- |
-| `replay`      | `consumer`                        | Unacknowledged `events` and nullable `gap`     |
-| `acknowledge` | `consumer`, `sequence`            | Acknowledges that individual retained delivery |
-| `accept_gap`  | `consumer`, `discardedThrough`    | Accepts the exact reported retention boundary  |
-| `release`     | `consumer`                        | Removes that durable consumer registration     |
-| `verify`      | `sequence`, `outcome`, `evidence` | Adds a separately linked verification          |
+| Operation     | Other arguments                   | Result                                                          |
+| ------------- | --------------------------------- | --------------------------------------------------------------- |
+| `replay`      | `consumer`                        | Unacknowledged `events`, nullable `gap` and `coverageUncertain` |
+| `acknowledge` | `consumer`, `sequence`            | Acknowledges that individual retained delivery                  |
+| `accept_gap`  | `consumer`, `discardedThrough`    | Accepts the exact reported retention boundary                   |
+| `release`     | `consumer`                        | Removes that durable consumer registration                      |
+| `verify`      | `sequence`, `outcome`, `evidence` | Adds a separately linked verification                           |
 
 Authority follows the MCP caller identity. An agent-scoped caller (the injected `?callerAgentId=` connection) may only pass its own agent ID as `parentAgentId`; any other parent is rejected for every operation, so agents cannot read, acknowledge, release, accept gaps for, or verify another parent's journal. The top-level MCP client has no caller identity and may act for any parent; this is the runner and CLI path, and it also performs verification. See [Runner transport](helper-completion-runner-transport.md) for the authentication that reaches it. Every connection shares one daemon bearer token and the caller ID is declared in the URL, so this separates cooperating agents and does not defend against a holder of the token who impersonates another agent. Per-agent credentials would be a separate change.
 
@@ -36,4 +36,4 @@ Replay reports `gap.discardedThrough` when a consumer's contiguous cursor predat
 
 Snapshot rewriting remains linear in retained events and cursor metadata for each append or acknowledgement. This bounds growth, not latency. Move to segmented storage if this ceiling is too costly; no throughput or power-loss durability claim is made. The shared atomic writer uses rename without fsync. It protects daemon-process crash recovery after a successful write, not sudden power loss.
 
-An observation append failure is logged with the parent and helper identity as not durably accepted. Provider descriptor projection and managed terminal processing continue. The daemon keeps in-memory failure markers for the 256 most recently failing parents. Each parent retains its newest 16 details, each limited to 256 UTF-16 code units plus an explicit truncation suffix. Older details become a count of further observations not durably accepted; the count saturates at the maximum safe integer and then reports a lower bound. These markers add less than 32 KiB of serialized gaps, so repeated failures cannot exhaust the 64 KiB entry limit on their own. The next successful append for that parent carries its markers in `gaps` and clears them from memory. Evicting a parent sets a process-wide overflow warning on every later new observation: failed observations for evicted parents may be missing. This warning stays set for the process lifetime, because later appends cannot establish full coverage for evicted parents. If no later append succeeds, the marker is not available through replay. A process crash before that later append loses the markers, omitted counts, overflow warning and failed observations, so consumers cannot detect that loss. A source event that never arrives cannot be reconstructed. An abrupt process death before any observation is persisted can leave no journal entry; unknown observations require an actual parent terminal or runtime-close observation. Older managed completions from before journaling was enabled are not inferred from presentation state.
+An observation append failure is logged with the parent and helper identity as not durably accepted. Provider descriptor projection and managed terminal processing continue. The daemon keeps in-memory failure markers for the 256 most recently failing parents. Each parent retains its newest 16 details, each limited to 256 UTF-16 code units plus an explicit truncation suffix. Older details become a count of further observations not durably accepted; the count saturates at the maximum safe integer and then reports a lower bound. These markers add less than 32 KiB of serialized gaps, so repeated failures cannot exhaust the 64 KiB entry limit on their own. The next successful append for that parent carries its markers in `gaps` and clears them from memory. Evicting a parent sets an overflow warning on every later new observation. Both replay scopes also expose host-wide coverage uncertainty immediately after any failed append. See [Helper completion coverage warning](helper-completion-coverage.md) for persistence, overflow lifetime and crash limits. A source event that never arrives cannot be reconstructed. An abrupt process death before any observation is persisted can leave no journal entry; unknown observations require an actual parent terminal or runtime-close observation. Older managed completions from before journaling was enabled are not inferred from presentation state.
