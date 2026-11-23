@@ -219,7 +219,7 @@ export class ProviderSubagentCompletionStore {
 
   private cursor(journal: Journal, parentAgentId: string, consumer: string) {
     z.string().min(1).max(128).parse(consumer);
-    z.string().min(1).max(128).parse(parentAgentId);
+    z.string().max(128).parse(parentAgentId);
     return (
       journal.consumers[JSON.stringify([parentAgentId, consumer])] ?? {
         through: consumer === "projection" ? (journal.acknowledgedThrough[parentAgentId] ?? 0) : 0,
@@ -228,13 +228,20 @@ export class ProviderSubagentCompletionStore {
     );
   }
 
-  consume(parentAgentId: string, consumer: string) {
+  private consumerLimitReached(journal: Journal, parentAgentId: string): boolean {
+    const host = parentAgentId === "";
+    return (
+      Object.keys(journal.consumers).filter((key) => key.startsWith('["",') === host).length >= 256
+    );
+  }
+
+  consume(parentAgentId: string, consumer: string, limit = 10_000) {
     return this.serialize(async () => {
       let journal = await this.load();
       const cursor = this.cursor(journal, parentAgentId, consumer);
       const key = JSON.stringify([parentAgentId, consumer]);
       if (!(key in journal.consumers)) {
-        if (Object.keys(journal.consumers).length >= 256)
+        if (this.consumerLimitReached(journal, parentAgentId))
           throw new Error("Completion consumer limit reached");
         await this.save({
           ...journal,
@@ -244,18 +251,36 @@ export class ProviderSubagentCompletionStore {
         journal = await this.load();
       }
       return {
-        events: journal.events.filter(
-          (e) =>
-            e.parentAgentId === parentAgentId &&
-            e.sequence > cursor.through &&
-            !cursor.acknowledged.includes(e.sequence),
-        ),
+        events: journal.events
+          .filter(
+            (e) =>
+              (parentAgentId === "" || e.parentAgentId === parentAgentId) &&
+              e.sequence > cursor.through &&
+              !cursor.acknowledged.includes(e.sequence),
+          )
+          .slice(0, limit),
         gap:
           cursor.through < journal.discardedThrough
             ? { discardedThrough: journal.discardedThrough }
             : null,
       };
     });
+  }
+
+  consumeHost(consumer: string, limit: number) {
+    return this.consume("", consumer, z.number().int().min(1).max(100).parse(limit));
+  }
+
+  acknowledgeHost(consumer: string, sequence: number) {
+    return this.acknowledge("", sequence, consumer);
+  }
+
+  acceptHostGap(consumer: string, discardedThrough: number) {
+    return this.acceptGap("", consumer, discardedThrough);
+  }
+
+  releaseHost(consumer: string) {
+    return this.releaseConsumer("", consumer);
   }
 
   async replay(parentAgentId: string, consumer = "projection") {
@@ -269,17 +294,22 @@ export class ProviderSubagentCompletionStore {
       const journal = await this.load();
       const cursor = this.cursor(journal, parentAgentId, consumer);
       if (sequence <= cursor.through || cursor.acknowledged.includes(sequence)) return;
-      if (!journal.events.some((e) => e.parentAgentId === parentAgentId && e.sequence === sequence))
+      if (
+        !journal.events.some(
+          (e) =>
+            (parentAgentId === "" || e.parentAgentId === parentAgentId) && e.sequence === sequence,
+        )
+      )
         throw new Error(`Cannot acknowledge unknown completion ${sequence}`);
       const key = JSON.stringify([parentAgentId, consumer]);
-      if (!(key in journal.consumers) && Object.keys(journal.consumers).length >= 256)
+      if (!(key in journal.consumers) && this.consumerLimitReached(journal, parentAgentId))
         throw new Error("Completion consumer limit reached");
       const acknowledged = [...cursor.acknowledged, sequence];
       let through = cursor.through;
       for (const event of journal.events.filter(
         (e) =>
           cursor.through >= journal.discardedThrough &&
-          e.parentAgentId === parentAgentId &&
+          (parentAgentId === "" || e.parentAgentId === parentAgentId) &&
           e.sequence > through,
       )) {
         if (!acknowledged.includes(event.sequence)) break;
@@ -304,7 +334,7 @@ export class ProviderSubagentCompletionStore {
         throw new Error("Retention boundary changed; replay again");
       const cursor = this.cursor(journal, parentAgentId, consumer);
       const key = JSON.stringify([parentAgentId, consumer]);
-      if (!(key in journal.consumers) && Object.keys(journal.consumers).length >= 256)
+      if (!(key in journal.consumers) && this.consumerLimitReached(journal, parentAgentId))
         throw new Error("Completion consumer limit reached");
       await this.save({
         ...journal,

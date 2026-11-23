@@ -2257,6 +2257,57 @@ function createToolCatalog(
   );
 
   registerTool(
+    "host_helper_completions",
+    {
+      title: "Host helper completions",
+      description:
+        "Replay retained host observations across parents. History and unobserved events may be missing; retention gaps require explicit acceptance. Top-level host clients only.",
+      inputSchema: z.discriminatedUnion("operation", [
+        z.object({
+          operation: z.literal("replay"),
+          consumer: helperConsumerSchema,
+          limit: z.number().int().min(1).max(100).default(100),
+        }),
+        z.object({
+          operation: z.literal("acknowledge"),
+          consumer: helperConsumerSchema,
+          sequence: z.number().int().positive(),
+        }),
+        z.object({
+          operation: z.literal("accept_gap"),
+          consumer: helperConsumerSchema,
+          discardedThrough: z.number().int().nonnegative(),
+        }),
+        z.object({ operation: z.literal("release"), consumer: helperConsumerSchema }),
+      ]),
+    },
+    async (input) => {
+      if (callerAgentId)
+        throw new PaseoToolInputError("Host helper completions require a top-level client");
+      const store = agentManager.completionEvents();
+      let result: unknown;
+      switch (input.operation) {
+        case "replay":
+          result = await store.consumeHost(input.consumer, input.limit);
+          break;
+        case "acknowledge":
+          await store.acknowledgeHost(input.consumer, input.sequence);
+          result = { acknowledged: input.sequence };
+          break;
+        case "accept_gap":
+          await store.acceptHostGap(input.consumer, input.discardedThrough);
+          result = { acceptedThrough: input.discardedThrough };
+          break;
+        case "release":
+          await store.releaseHost(input.consumer);
+          result = { released: true };
+          break;
+      }
+      return { content: [], structuredContent: ensureValidJson(result) };
+    },
+  );
+
+  registerTool(
     "list_agents",
     {
       title: "List agents",

@@ -2309,6 +2309,15 @@ test("helper_completions limits agent callers to their own parent and leaves the
   const call = (client: Client, args: Record<string, unknown>) =>
     client.callTool({ name: "helper_completions", arguments: args });
   try {
+    const hostReplay = {
+      name: "host_helper_completions",
+      arguments: { operation: "replay", consumer: "host", limit: 1 },
+    };
+    expect((await a.client.callTool(hostReplay)).isError).toBe(true);
+    expect((await host.client.callTool(hostReplay)).structuredContent).toMatchObject({
+      events: [{ parentAgentId: "parent-a" }],
+      gap: null,
+    });
     // Each agent can use the journal for its own helpers.
     expect(
       (await call(a.client, { operation: "replay", parentAgentId: "parent-a", consumer: "mine" }))
@@ -2526,4 +2535,40 @@ test("external consumer capacity cannot block lifecycle recovery", async () => {
   ]);
   await manager.closeAgent(AGENT_IDS[0]);
   await manager.flush();
+});
+
+test("host completion replay survives restart, retention and activity across parents", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-host-"));
+  let store = new ProviderSubagentCompletionStore(root, 3);
+  for (let i = 0; i < 4; i++)
+    await store.append(`parent-${i}`, "codex", {
+      type: "upsert",
+      id: `helper-${i}`,
+      status: "completed",
+    });
+  for (let i = 0; i < 256; i++) await store.consume(`registered-${i}`, "old");
+  expect(await store.consumeHost("runner", 2)).toMatchObject({
+    events: [
+      { sequence: 2, parentAgentId: "parent-1" },
+      { sequence: 3, parentAgentId: "parent-2" },
+    ],
+    gap: { discardedThrough: 1 },
+  });
+  await store.acceptHostGap("runner", 1);
+  await store.acknowledgeHost("runner", 2);
+  await store.acknowledgeHost("runner", 3);
+  store = new ProviderSubagentCompletionStore(root, 3);
+  expect(await store.consumeHost("runner", 2)).toMatchObject({
+    events: [{ sequence: 4 }],
+    gap: null,
+  });
+  await store.append("parent-1", "codex", { type: "upsert", id: "late", status: "completed" });
+  expect(await store.consumeHost("runner", 2)).toMatchObject({
+    events: [{ sequence: 4 }, { sequence: 5 }],
+  });
+  await store.releaseHost("runner");
+  expect(await store.consumeHost("runner", 2)).toMatchObject({
+    events: [{ sequence: 3 }, { sequence: 4 }],
+    gap: { discardedThrough: 2 },
+  });
 });
