@@ -4173,6 +4173,8 @@ describe("session checkout status handling", () => {
     const workspaceRuntimeStore = { ...createWorkspaceRuntimeStore(), get: vi.fn() };
     const workspaceGitService = {
       getSnapshot: vi.fn().mockResolvedValue(createWorkspaceGitSnapshot("/tmp/service-worktree")),
+      // A watched directory reads its kept snapshot.
+      hasWorkspaceListener: () => true,
     };
     const session = createSessionForTest({ workspaceRuntimeStore, workspaceGitService, messages });
 
@@ -4183,7 +4185,7 @@ describe("session checkout status handling", () => {
     });
 
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledTimes(1);
-    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/service-worktree");
+    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/service-worktree", undefined);
     expect(checkoutGitMocks.getCheckoutStatus).not.toHaveBeenCalled();
     expect(messages).toContainEqual({
       type: "checkout_status_response",
@@ -4223,6 +4225,7 @@ describe("session checkout status handling", () => {
           },
         }),
       ),
+      hasWorkspaceListener: () => false,
     };
     const session = createSessionForTest({ workspaceRuntimeStore, workspaceGitService, messages });
 
@@ -4234,6 +4237,11 @@ describe("session checkout status handling", () => {
 
     expect(workspaceRuntimeStore.get).not.toHaveBeenCalled();
     expect(workspaceGitService.getSnapshot).toHaveBeenCalledTimes(1);
+    // No listener holds the directory, so the read is forced instead of trusting a kept snapshot.
+    expect(workspaceGitService.getSnapshot).toHaveBeenCalledWith("/tmp/cold-worktree", {
+      force: true,
+      reason: "checkout-status-request",
+    });
     expect(messages).toContainEqual({
       type: "checkout_status_response",
       payload: expect.objectContaining({
