@@ -1,6 +1,6 @@
 # Caller identity for helper completions
 
-Status: accepted. Supersedes the shared-bearer limit statements in [Durable helper observations and consumers](helper-completion-consumers.md), [Host replay](helper-completion-host-replay.md) and [Runner transport](helper-completion-runner-transport.md). Those three keep their other decisions; read each shared-bearer or capability-token limit there as replaced by this ADR.
+Status: accepted. Supersedes the shared-bearer limit statements in [Durable helper observations and consumers](helper-completion-consumers.md), [Host replay](helper-completion-host-replay.md) and [Runner transport](helper-completion-runner-transport.md). It also supersedes the runner-transport detail that an agent child inherits `PASEO_PASSWORD`. Those ADRs keep their other decisions; read each shared-bearer, capability-token, or password-inheritance detail there as replaced by this ADR.
 
 ## Decision
 
@@ -22,7 +22,9 @@ No new credential is stored. The token is derived per launch from the per-daemon
 
 ## Host credentials stay out of child environments
 
-The per-agent token only matters if the child cannot also present a host credential. The daemon took its password from `PASEO_PASSWORD` in deployment mode (Docker, a service manager), and every external child inherited it through `process.env`, so an agent, its MCP servers or a terminal could send it as the host bearer and ignore its scoped token. `createExternalProcessEnv` (`packages/server/src/server/paseo-env.ts`) now drops `PASEO_PASSWORD` from the inherited environment. It is the single constructor behind provider launches, the OMP MCP bridge, terminals, worktree setup commands and the self-node command.
+The per-agent token only matters if the child cannot also present a host credential. In deployment mode (Docker or a service manager), the daemon reads its password from `PASEO_PASSWORD`. `createExternalProcessEnv` (`packages/server/src/server/paseo-env.ts`) removes it from the inherited environment before applying the explicit overlay. Its callers are `packages/server/src/server/agent/provider-launch-config.ts`, `packages/server/src/server/agent/providers/claude/query.ts`, `packages/server/src/server/agent/providers/omp/agent.ts`, `packages/server/src/server/agent/providers/omp/cli-runtime.ts`, `packages/server/src/server/agent/providers/pi/cli-runtime.ts`, `packages/server/src/utils/worktree.ts`, `packages/server/src/utils/spawn.ts`, `packages/server/src/terminal/terminal.ts`, `packages/server/src/terminal/worker-terminal-manager.ts`, and `packages/server/src/terminal/terminal-worker-launch.ts`. These cover provider launches, the OMP MCP bridge, terminals, worktree setup, and the self-node command. The terminal launcher passes its scrubbed environment to the detached worker. An explicit overlay can still pass the variable through.
+
+This is a constructor boundary, not a daemon-wide child-process scrub. Other daemon-side children that pass `process.env` directly, including GitHub service children (`packages/server/src/services/github-service.ts`), SSH hostname resolution (`packages/server/src/utils/ssh-hostname.ts`) and CLI subprocesses, can still inherit `PASEO_PASSWORD`. Same-user processes can also read the daemon's `/proc/<pid>/environ` where the OS permits it; see the same-user limit below.
 
 - An explicit overlay still sets it: a provider profile's `env` that names `PASEO_PASSWORD`, for an agent that should reach another daemon, is the operator's choice and is passed through.
 - The CLI inside an agent still connects. Without the password it falls back to `$PASEO_HOME/local-credential` for local targets. Remote targets need `password=` in the host URI.
@@ -37,8 +39,7 @@ The per-agent token only matters if the child cannot also present a host credent
 ## Limits
 
 - **No password configured: no caller isolation.** The route accepts every request, so any process that can reach the listener can declare any `callerAgentId`, or none and get host scope, with or without a token. `isAgentMcpRequestAuthorized` returns true unconditionally there (`auth.test.ts` records this). Per-agent tokens are still injected but nothing checks them. Set a password to get the isolation in this ADR.
-- **Same-user processes:** an agent runs as the daemon's OS user. It can read what that user can read: `$PASEO_HOME/local-credential`, the launch config of another agent, and the daemon's own `/proc/<pid>/environ`. Scrubbing the environment closes inheritance and leaves deliberate reads open. Per-agent tokens stop a token holder from crossing agents over MCP. They do not sandbox a hostile local process.
-- **The terminal worker still holds the password in its own environment.** The daemon starts it with `process.env`; terminal children are scrubbed, the worker process is not.
+- **Same-user processes:** an agent runs as the daemon's OS user. It can read what that user can read: `$PASEO_HOME/local-credential`, another agent's launch config, and the daemon's own `/proc/<pid>/environ`. Constructor scrubbing closes inheritance only on the callers listed above. Per-agent tokens stop a token holder from crossing agents over MCP; they do not sandbox a hostile local process.
 - **Bearer replay:** a token is a bearer secret. Anyone who reads agent A's launch config can act as A until the daemon restarts. Tokens are not revoked when an agent is archived.
 - **Host authority is still one shared secret:** the password (or the capability token) grants every parent's journal. Separate runner credentials would be a separate change to daemon permissions ([permissions](../permissions.md)).
 - **Local-credential-only hosts** still have no path to the journal, as recorded in [Runner transport](helper-completion-runner-transport.md).
