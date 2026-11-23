@@ -195,6 +195,7 @@ async function archiveByScopeWithPriority(
 
     let removedDirectory = false;
     let directoryLeftBehind: ArchiveResult["directoryLeftBehind"];
+    let completed = false;
 
     try {
       if (targetWorkspaceIds.length > 0) {
@@ -209,20 +210,9 @@ async function archiveByScopeWithPriority(
       );
       checkpoint();
 
-      if (target.backing?.mainRepoRoot) {
-        try {
-          await dependencies.workspaceGitService.getSnapshot(target.backing.mainRepoRoot, {
-            force: true,
-            reason: "archive-worktree",
-          });
-        } catch (error) {
-          dependencies.sessionLogger?.warn(
-            { err: error, cwd: target.backing.mainRepoRoot, requestId: request.requestId },
-            "Failed to force-refresh workspace git snapshot after archiving",
-          );
-        }
-      }
-
+      // Past this point the records are archived and the directory is on its way out, so the
+      // main repo's listing must be refreshed even if removal fails.
+      completed = true;
       if (target.backing !== null) {
         const removal = await maybeRemoveDirectory(
           dependencies,
@@ -241,9 +231,17 @@ async function archiveByScopeWithPriority(
         ...(directoryLeftBehind ? { directoryLeftBehind } : {}),
       };
     } finally {
+      // The marker clears synchronously here, so clients never keep seeing `archiving` and a
+      // canceled or failed archive leaves nothing stuck. The refresh and the final fan-out start
+      // here and are not awaited: the response must not wait on git or on every subscriber.
       if (targetWorkspaceIds.length > 0) {
         dependencies.clearWorkspaceArchiving(targetWorkspaceIds);
-        await dependencies.emitWorkspaceUpdatesForWorkspaceIds(targetWorkspaceIds);
+      }
+      if (completed) {
+        refreshMainRepoSnapshotAfterArchive(dependencies, target.backing, request.requestId);
+      }
+      if (targetWorkspaceIds.length > 0) {
+        emitFinalWorkspaceUpdates(dependencies, targetWorkspaceIds, request.requestId);
       }
     }
   };
@@ -255,6 +253,40 @@ async function archiveByScopeWithPriority(
     return dependencies.workspaceArchiveOperations.withCheckout(checkoutPath, runArchive);
   }
   return runArchive();
+}
+
+// Deliberately longer than the request: a cold snapshot can shell out to git. Started after the
+// worktree is removed so it cannot cache the listing that removal just invalidated.
+function refreshMainRepoSnapshotAfterArchive(
+  dependencies: ArchiveDependencies,
+  backing: BackingDirectory | null,
+  requestId: string,
+): void {
+  const mainRepoRoot = backing?.mainRepoRoot;
+  if (!mainRepoRoot) {
+    return;
+  }
+  void dependencies.workspaceGitService
+    .getSnapshot(mainRepoRoot, { force: true, reason: "archive-worktree" })
+    .catch((error: unknown) => {
+      dependencies.sessionLogger?.warn(
+        { err: error, cwd: mainRepoRoot, requestId },
+        "Failed to force-refresh workspace git snapshot after archiving",
+      );
+    });
+}
+
+function emitFinalWorkspaceUpdates(
+  dependencies: ArchiveDependencies,
+  workspaceIds: string[],
+  requestId: string,
+): void {
+  void dependencies.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds).catch((error: unknown) => {
+    dependencies.sessionLogger?.warn(
+      { err: error, workspaceIds, requestId },
+      "Failed to emit final workspace updates after archiving",
+    );
+  });
 }
 
 async function resolveArchiveCheckoutPath(
