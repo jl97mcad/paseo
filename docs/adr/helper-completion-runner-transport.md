@@ -1,6 +1,6 @@
 # Runner transport for helper completions
 
-Status: accepted. Extends [Durable helper observations and consumers](helper-completion-consumers.md). Its password-inheritance detail is superseded by [Caller identity](helper-completion-caller-identity.md).
+Status: accepted. Extends [Durable helper observations and consumers](helper-completion-consumers.md). See [Caller identity](helper-completion-caller-identity.md) for the host-credential requirement and current agent credentials.
 
 ## Decision
 
