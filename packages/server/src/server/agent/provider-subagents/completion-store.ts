@@ -39,6 +39,7 @@ const journalSchema = z.object({
   nextSequence: z.number().int().positive().optional(),
   discardedThrough: z.number().int().nonnegative().default(0),
   events: z.array(completionSchema),
+  coverageUncertain: z.boolean().default(false),
 });
 type Journal = z.infer<typeof journalSchema>;
 
@@ -89,7 +90,13 @@ export class ProviderSubagentCompletionStore {
       this.journal = journalSchema.parse(JSON.parse(await readFile(this.file, "utf8")));
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
-      this.journal = { acknowledgedThrough: {}, consumers: {}, discardedThrough: 0, events: [] };
+      this.journal = {
+        acknowledgedThrough: {},
+        consumers: {},
+        discardedThrough: 0,
+        events: [],
+        coverageUncertain: false,
+      };
     }
     return this.journal;
   }
@@ -124,6 +131,7 @@ export class ProviderSubagentCompletionStore {
         },
       ]),
     );
+    next.coverageUncertain ||= this.failedAppends.size > 0 || this.failureTrackingOverflowed;
     await this.persist(this.file, next);
     this.journal = next;
   }
@@ -295,6 +303,10 @@ export class ProviderSubagentCompletionStore {
         journal = await this.load();
       }
       return {
+        coverageUncertain:
+          journal.coverageUncertain ||
+          this.failedAppends.size > 0 ||
+          this.failureTrackingOverflowed,
         events: journal.events
           .filter(
             (e) =>
@@ -444,6 +456,10 @@ export class ProviderSubagentCompletionStore {
   }
 
   flush(): Promise<void> {
-    return this.pending.then(() => undefined);
+    return this.serialize(async () => {
+      if (this.failedAppends.size === 0 && !this.failureTrackingOverflowed) return;
+      const journal = await this.load();
+      await this.save({ ...journal, events: [...journal.events] });
+    });
   }
 }

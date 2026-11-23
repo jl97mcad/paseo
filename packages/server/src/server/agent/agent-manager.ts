@@ -6343,6 +6343,9 @@ export class AgentManager {
    */
   async flushForShutdown(): Promise<void> {
     await this.flushTasks({ includeAgentRegistrations: true });
+    await this.providerSubagentCompletionStore?.flush().catch((error) => {
+      this.logger.warn({ err: error }, "Failed to persist helper completion coverage at shutdown");
+    });
   }
 
   private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {

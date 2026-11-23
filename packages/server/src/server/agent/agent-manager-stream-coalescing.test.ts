@@ -2015,6 +2015,47 @@ test("managed terminal settles when its journal append fails", async () => {
   expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[1])).toHaveLength(1);
 });
 
+test("failed observation coverage remains visible after a clean store flush", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-coverage-"));
+  let fail = true;
+  const store = new ProviderSubagentCompletionStore(root, 10000, async (file, data) => {
+    if (fail) throw new Error("journal unavailable");
+    await writeJsonFileAtomic(file, data);
+  });
+  await expect(
+    store.append(AGENT_IDS[0], "codex", {
+      type: "upsert",
+      id: "helper-failed",
+      status: "completed",
+    }),
+  ).rejects.toThrow("journal unavailable");
+  store.recordFailedAppend(AGENT_IDS[0], "helper-failed", "provider-stream");
+  await expect(store.flush()).rejects.toThrow("journal unavailable");
+  // A new instance cannot see memory that was never written, as after an abrupt exit.
+  expect(
+    (await new ProviderSubagentCompletionStore(root).consume(AGENT_IDS[0], "before-recovery"))
+      .coverageUncertain,
+  ).toBe(false);
+  fail = false;
+  await store.flush();
+  const replay = await new ProviderSubagentCompletionStore(root).consume(AGENT_IDS[0], "recovery");
+  expect(replay.events).toEqual([]);
+  expect(replay.coverageUncertain).toBe(true);
+});
+
+test("shutdown continues when completion coverage persistence fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "completion-shutdown-"));
+  const logs: string[] = [];
+  const logger = pino({ level: "warn" }, { write: (line) => logs.push(line) });
+  const store = new ProviderSubagentCompletionStore(root, 10000, async () => {
+    throw new Error("journal unavailable");
+  });
+  store.recordFailedAppend("parent", "helper", "provider-stream");
+  const manager = new AgentManager({ clients: {}, providerSubagentCompletionStore: store, logger });
+  await expect(manager.flushForShutdown()).resolves.toBeUndefined();
+  expect(logs.join("")).toContain("Failed to persist helper completion coverage at shutdown");
+});
+
 test("provider subagent projection survives a failed journal append", async () => {
   const root = mkdtempSync(join(tmpdir(), "provider-append-failure-"));
   const logger = createTestLogger();
@@ -2282,9 +2323,15 @@ test("helper_completions limits agent callers to their own parent and leaves the
   const logger = createTestLogger();
   const store = new ProviderSubagentCompletionStore(root);
   const storage = new AgentStorage(join(root, "agents"), logger);
-  const manager = new AgentManager({ clients: {}, providerSubagentCompletionStore: store, logger });
   await store.append("parent-a", "codex", { type: "upsert", id: "helper-a", status: "completed" });
   await store.append("parent-b", "codex", { type: "upsert", id: "helper-b", status: "completed" });
+  store.recordFailedAppend("parent-a", "unwritten-helper", "provider-stream");
+  await store.flush();
+  const manager = new AgentManager({
+    clients: {},
+    providerSubagentCompletionStore: new ProviderSubagentCompletionStore(root),
+    logger,
+  });
   const providers = new ProviderSnapshotManager({ logger });
   const connect = async (callerAgentId?: string) => {
     const server = await createAgentMcpServer({
@@ -2315,6 +2362,7 @@ test("helper_completions limits agent callers to their own parent and leaves the
     };
     expect((await a.client.callTool(hostReplay)).isError).toBe(true);
     expect((await host.client.callTool(hostReplay)).structuredContent).toMatchObject({
+      coverageUncertain: true,
       events: [{ parentAgentId: "parent-a" }],
       gap: null,
     });
