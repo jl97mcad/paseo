@@ -1,6 +1,6 @@
 # Adapter-inferred helper outcomes
 
-Status: accepted. Extends [Durable helper observations and consumers](helper-completion-consumers.md) and supersedes its implicit rule that every upsert reaching the journal from a provider adapter is recorded as `provider-stream`. Identity, retention and replay rules there are unchanged.
+Status: superseded by [Inferred outcome corrections](helper-completion-inferred-corrections.md). Extends [Durable helper observations and consumers](helper-completion-consumers.md) and supersedes its implicit rule that every upsert reaching the journal from a provider adapter is recorded as `provider-stream`. Identity, retention and replay rules there are unchanged.
 
 ## Decision
 

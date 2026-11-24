@@ -938,8 +938,8 @@ export class OmpAgentSession implements AgentSession {
           return;
         }
         this.usagePoller.stopTurn();
-        this.resetActiveTurn({ terminalizeWork: true });
         if (isOmpRequestAbortError(error)) {
+          this.resetActiveTurn({ terminalizeWork: true, cause: "turn canceled" });
           this.emit({
             type: "turn_canceled",
             provider: this.provider,
@@ -948,6 +948,7 @@ export class OmpAgentSession implements AgentSession {
           });
           return;
         }
+        this.resetActiveTurn({ terminalizeWork: true, cause: "turn failed" });
         this.emit({
           type: "turn_failed",
           provider: this.provider,
@@ -1183,7 +1184,7 @@ export class OmpAgentSession implements AgentSession {
     await this.runtimeSession.abort();
     if (turnId && this.activeTurnId === turnId) {
       this.usagePoller.stopTurn();
-      this.resetActiveTurn({ terminalizeWork: true });
+      this.resetActiveTurn({ terminalizeWork: true, cause: "turn canceled" });
       this.emit({
         type: "turn_canceled",
         provider: this.provider,
@@ -1253,19 +1254,21 @@ export class OmpAgentSession implements AgentSession {
     this.subagentCardTracker.clear();
   }
 
-  private terminalizeActiveWork(): void {
+  private terminalizeActiveWork(cause: string): void {
     for (const [toolCallId, toolCall] of this.activeToolCalls) {
       this.emitToolCallEvent(toolCallId, toolCall, "canceled", null, null);
     }
     this.activeToolCalls.clear();
-    for (const event of this.subagentIndex.terminalizeRunning(this.runtimeSession)) {
+    for (const event of this.subagentIndex.terminalizeRunning(this.runtimeSession, cause)) {
       this.emit(event);
     }
     this.clearOmpTurnState();
   }
 
-  private resetActiveTurn({ terminalizeWork }: { terminalizeWork: boolean }): void {
-    if (terminalizeWork) this.terminalizeActiveWork();
+  private resetActiveTurn(
+    options: { terminalizeWork: true; cause: string } | { terminalizeWork: false },
+  ): void {
+    if (options.terminalizeWork) this.terminalizeActiveWork(options.cause);
     this.activeTurnId = null;
     this.activeAssistantMessageId = null;
     this.activeTurnTerminalAssistantMessage = null;
@@ -1414,7 +1417,7 @@ export class OmpAgentSession implements AgentSession {
     this.emitBufferedNoTurnOutputs(turnId);
     if (error) {
       this.usagePoller.stopTurn();
-      this.resetActiveTurn({ terminalizeWork: true });
+      this.resetActiveTurn({ terminalizeWork: true, cause: "turn failed" });
       this.emit({ type: "turn_failed", provider: this.provider, turnId, error });
       return;
     }
@@ -1877,13 +1880,13 @@ export class OmpAgentSession implements AgentSession {
     void this.hostTools?.close();
     this.usagePoller.stopTurn();
     if (!this.activeTurnId) {
-      this.terminalizeActiveWork();
+      this.terminalizeActiveWork("process lost");
       this.subagentIndex.clear(this.runtimeSession);
       this.emit({ type: "turn_failed", provider: this.provider, error });
       return;
     }
     const turnId = this.activeTurnId;
-    this.resetActiveTurn({ terminalizeWork: true });
+    this.resetActiveTurn({ terminalizeWork: true, cause: "process lost" });
     this.subagentIndex.clear(this.runtimeSession);
     this.emit({
       type: "turn_failed",
@@ -2228,7 +2231,7 @@ export class OmpAgentSession implements AgentSession {
     // text as an error. That is the user's own Stop, not a failed turn.
     if (isOmpAbortedTerminalResponse(messages)) {
       this.usagePoller.stopTurn();
-      this.resetActiveTurn({ terminalizeWork: true });
+      this.resetActiveTurn({ terminalizeWork: true, cause: "turn canceled" });
       this.emit({
         type: "turn_canceled",
         provider: this.provider,
@@ -2240,7 +2243,7 @@ export class OmpAgentSession implements AgentSession {
     const errorMessage = latestOmpErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
-      this.resetActiveTurn({ terminalizeWork: true });
+      this.resetActiveTurn({ terminalizeWork: true, cause: "turn failed" });
       this.emit({
         type: "turn_failed",
         provider: this.provider,
@@ -2269,7 +2272,7 @@ export class OmpAgentSession implements AgentSession {
     while (!this.closed && this.activeTurnStarted && this.currentTurnIdForEvent() === turnId) {
       if (Date.now() >= deadline) {
         this.usagePoller.stopTurn();
-        this.resetActiveTurn({ terminalizeWork: true });
+        this.resetActiveTurn({ terminalizeWork: true, cause: "provider idle deadline" });
         this.emit({
           type: "turn_failed",
           provider: this.provider,

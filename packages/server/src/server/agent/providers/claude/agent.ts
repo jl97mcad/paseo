@@ -2900,7 +2900,7 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     if (this.autonomousTurn) {
-      this.flushPendingToolCalls();
+      this.flushPendingToolCalls("turn canceled");
       this.completeAutonomousTurn();
     }
 
@@ -3339,7 +3339,7 @@ class ClaudeAgentSession implements AgentSession {
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     // AgentManager settles the run after runtime release. Preserve cleanup records
     // without reporting this closure as an explicit turn cancellation.
-    this.flushPendingToolCalls();
+    this.flushPendingToolCalls("session closed");
     this.subscribers.clear();
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -4364,7 +4364,7 @@ class ClaudeAgentSession implements AgentSession {
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
     if (event.type === "turn_failed" || event.type === "turn_canceled") {
-      this.flushPendingToolCalls();
+      this.flushPendingToolCalls(event.type === "turn_failed" ? "turn failed" : "turn canceled");
     }
     this.notifySubscribers(event);
     this.activeForegroundTurnId = null;
@@ -4433,7 +4433,7 @@ class ClaudeAgentSession implements AgentSession {
 
   private failActiveTurns(errorMessage: string): void {
     const failure = this.buildTurnFailedEvent(errorMessage);
-    this.flushPendingToolCalls();
+    this.flushPendingToolCalls("turn failed");
     if (this.activeForegroundTurnId) {
       this.finishForegroundTurn(failure);
       return;
@@ -5720,7 +5720,7 @@ class ClaudeAgentSession implements AgentSession {
     this.pushEvent({ type: "timeline", item, provider: "claude" });
   }
 
-  private flushPendingToolCalls() {
+  private flushPendingToolCalls(cause: "turn canceled" | "turn failed" | "session closed") {
     for (const [id, entry] of this.toolUseCache) {
       if (entry.started) {
         this.pushToolCall(
@@ -5740,7 +5740,7 @@ class ClaudeAgentSession implements AgentSession {
     // holds — a backgrounded child that settles after the interrupt would find no descriptor to
     // land on, and ownership would flip back to the legacy tracker mid-session.
     for (const event of foldSubagentObservations(
-      this.taskProtocolSource.cancelRunningForegroundTasks(),
+      this.taskProtocolSource.cancelRunningForegroundTasks(cause),
     )) {
       this.pushEvent({ type: "provider_subagent", provider: "claude", event });
     }

@@ -524,7 +524,7 @@ describe("ClaudeTaskProtocolSource", () => {
         kind: "status",
         id: "toolu_01DgLoPMW9",
         status: "canceled",
-        inferred: "foreground task still running when the turn was canceled",
+        inferred: "foreground task still running: turn canceled",
       },
     ]);
     // Idempotent: the child is no longer running, so a second cancellation says nothing.
@@ -579,7 +579,7 @@ describe("ClaudeTaskProtocolSource", () => {
         kind: "status",
         id: "toolu_01DgLoPMW9",
         status: "canceled",
-        inferred: "foreground task still running when the turn was canceled",
+        inferred: "foreground task still running: turn canceled",
       },
     ]);
   });

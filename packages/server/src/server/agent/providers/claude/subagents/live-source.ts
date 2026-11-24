@@ -308,7 +308,7 @@ export class ClaudeTaskProtocolSource {
    * Backgrounded children are skipped. Being backgrounded is precisely the declaration that they
    * outlive the turn; everything else was running in the foreground and died with it.
    */
-  cancelRunningForegroundTasks(): SubagentObservation[] {
+  cancelRunningForegroundTasks(cause = "turn canceled"): SubagentObservation[] {
     const observations: SubagentObservation[] = [];
     for (const id of this.declaredIds) {
       if (this.backgroundedIds.has(id)) continue;
@@ -318,7 +318,7 @@ export class ClaudeTaskProtocolSource {
         kind: "status",
         id,
         status: "canceled",
-        inferred: "foreground task still running when the turn was canceled",
+        inferred: `foreground task still running: ${cause}`,
       });
     }
     return observations;

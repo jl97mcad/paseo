@@ -1537,7 +1537,7 @@ export class AgentManager {
     // Acks describe delivery, not whether this process still has its projection.
     for (const completion of await store.readAll(parentAgentId)) {
       if (
-        completion.provenance !== "provider-stream" ||
+        completion.provenance === "managed-lifecycle" ||
         completion.kind !== "completion" ||
         completion.outcome === "unknown"
       )

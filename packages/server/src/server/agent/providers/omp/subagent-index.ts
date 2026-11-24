@@ -64,7 +64,7 @@ export class OmpSubagentIndex {
     );
   }
 
-  terminalizeRunning(parent: object): AgentStreamEvent[] {
+  terminalizeRunning(parent: object, cause: string): AgentStreamEvent[] {
     const states = this.statesByParent.get(parent);
     if (!states) {
       return [];
@@ -75,9 +75,7 @@ export class OmpSubagentIndex {
         continue;
       }
       state.status = "canceled";
-      events.push(
-        this.upsert(id, state.status, state, "helper still running when the turn was interrupted"),
-      );
+      events.push(this.upsert(id, state.status, state, `helper still running: ${cause}`));
     }
     return events;
   }

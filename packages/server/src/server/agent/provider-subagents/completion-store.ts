@@ -72,22 +72,25 @@ function missingEvidence(
     .map(([gap]) => gap);
 }
 
-/** A re-read of state adds nothing once the helper has any completion on record. */
+/** Suppress only the same retained snapshot outcome. */
 function isRepeatedSnapshot(
   journal: Journal,
   parentAgentId: string,
   provider: AgentProvider,
   event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
 ): boolean {
+  if (!event.inferred?.snapshot) return false;
+  const latest = journal.events.findLast(
+    (entry) =>
+      entry.parentAgentId === parentAgentId &&
+      entry.provider === provider &&
+      entry.helperId === event.id &&
+      entry.kind === "completion",
+  );
   return (
-    event.inferred?.snapshot === true &&
-    journal.events.some(
-      (entry) =>
-        entry.parentAgentId === parentAgentId &&
-        entry.provider === provider &&
-        entry.helperId === event.id &&
-        entry.kind === "completion",
-    )
+    latest?.provenance === ADAPTER_INFERRED_PROVENANCE &&
+    latest.outcome === event.status &&
+    latest.gaps.includes("snapshot observation")
   );
 }
 
@@ -104,7 +107,10 @@ function describeSource(
   return {
     sourceEventTime: undefined,
     recordedProvenance: ADAPTER_INFERRED_PROVENANCE,
-    inferredGaps: [`outcome inferred by adapter: ${event.inferred.reason}`],
+    inferredGaps: [
+      `outcome inferred by adapter: ${event.inferred.reason}`,
+      ...(event.inferred.snapshot ? ["snapshot observation"] : []),
+    ],
   };
 }
 

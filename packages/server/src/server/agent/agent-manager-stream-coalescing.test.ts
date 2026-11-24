@@ -30,6 +30,11 @@ import {
   foldSubagentObservations,
   type SubagentObservation,
 } from "./providers/claude/subagents/observation.js";
+import { OpenCodeAgentClient } from "./providers/opencode-agent.js";
+import {
+  TestOpenCodeClient,
+  TestOpenCodeHarness,
+} from "./providers/opencode/test-utils/test-opencode-harness.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import { FakeOmp } from "./providers/omp/test-utils/fake-omp.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
@@ -3215,12 +3220,13 @@ describe("adapter-inferred helper terminals", () => {
     ]);
     expect(journal[0]?.gaps).not.toContain("outcome inferred by adapter");
     expect(journal[1]?.gaps).toContain(
-      "outcome inferred by adapter: foreground task still running when the turn was canceled",
+      "outcome inferred by adapter: foreground task still running: turn canceled",
     );
     expect(journal[2]?.gaps).toContain(
       "outcome inferred by adapter: Claude process lost while the task was running",
     );
-    // Projection is unchanged: the descriptors still show the inferred outcome.
+    await manager.reloadAgentSession(AGENT_IDS[0]);
+    // Reload reconstructs inferred outcomes from the journal.
     expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
       { id: "toolu_native", status: "completed" },
       { id: "toolu_canceled", status: "canceled" },
@@ -3269,7 +3275,7 @@ describe("adapter-inferred helper terminals", () => {
       sourceEventId: null,
       nativeTurnId: null,
       gaps: expect.arrayContaining([
-        "outcome inferred by adapter: helper still running when the turn was interrupted",
+        "outcome inferred by adapter: helper still running: turn canceled",
       ]),
     });
     expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
@@ -3278,17 +3284,84 @@ describe("adapter-inferred helper terminals", () => {
     ]);
   });
 
+  test("OpenCode marks startup and recovered child state as snapshots", async () => {
+    const runtime = new TestOpenCodeHarness();
+    const sdk = new TestOpenCodeClient();
+    sdk.sessionCreateResponse = { data: { id: "parent" } };
+    sdk.sessionChildrenResponses = [
+      { data: [{ id: "startup", parentID: "parent" }] },
+      { data: [] },
+    ];
+    runtime.enqueueClient(sdk);
+    const client = new OpenCodeAgentClient(createTestLogger(), undefined, {
+      serverManager: runtime,
+      createClient: runtime.createClient,
+    });
+    const session = await client.createSession({ provider: "opencode", cwd: "/workspace/repo" });
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    try {
+      await vi.waitFor(() =>
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "provider_subagent",
+            event: expect.objectContaining({
+              id: "startup",
+              status: "completed",
+              inferred: { reason: "child not busy when the session was read", snapshot: true },
+            }),
+          }),
+        ),
+      );
+      sdk.sessionChildrenResponses = [
+        { data: [{ id: "recovered", parentID: "parent", directory: "/workspace/repo" }] },
+        { data: [] },
+      ];
+      sdk.sessionMessagesResponse = {
+        data: [
+          {
+            info: {
+              id: "message",
+              sessionID: "recovered",
+              role: "assistant",
+              error: { name: "ProviderError", data: { message: "failed" } },
+            },
+            parts: [],
+          },
+        ],
+      };
+      sdk.emitEvent({ type: "server.connected", properties: {} });
+      await vi.waitFor(() =>
+        expect(events).toContainEqual(
+          expect.objectContaining({
+            type: "provider_subagent",
+            event: expect.objectContaining({
+              id: "recovered",
+              status: "failed",
+              inferred: {
+                reason: "child outcome read from session state on recovery",
+                snapshot: true,
+              },
+            }),
+          }),
+        ),
+      );
+    } finally {
+      await session.close();
+    }
+  });
+
   test("a re-read state snapshot journals once per helper, and never after a recorded terminal", async () => {
     const client = new TestAgentClient();
     const { root, completions, manager } = await setup("codex", { codex: client });
     const session = client.getSession(root);
-    const snapshot = (id: string) => ({
+    const snapshot = (id: string, status: "completed" | "failed" = "completed") => ({
       type: "provider_subagent" as const,
       provider: "opencode" as const,
       event: {
         type: "upsert" as const,
         id,
-        status: "completed" as const,
+        status,
         inferred: { reason: "child not busy when the session was read", snapshot: true as const },
       },
     });
@@ -3301,6 +3374,7 @@ describe("adapter-inferred helper terminals", () => {
       event: { type: "upsert", id: "native-first", status: "completed" },
     });
     session.pushEvent(snapshot("native-first"));
+    session.pushEvent(snapshot("seen-twice", "failed"));
     await waitForSessionEventQueue();
     await manager.flush();
 
@@ -3312,6 +3386,30 @@ describe("adapter-inferred helper terminals", () => {
     ).toEqual([
       { helperId: "seen-twice", provenance: "adapter-inferred" },
       { helperId: "native-first", provenance: "provider-stream" },
+      { helperId: "native-first", provenance: "adapter-inferred" },
+      { helperId: "seen-twice", provenance: "adapter-inferred" },
     ]);
+    expect(manager.listProviderSubagents(AGENT_IDS[0])).toContainEqual(
+      expect.objectContaining({
+        id: "seen-twice",
+        status: "failed",
+        completionEvidence: expect.objectContaining({ outcome: "failed" }),
+      }),
+    );
+    session.pushEvent(snapshot("seen-twice"));
+    await waitForSessionEventQueue();
+    await manager.flush();
+    expect((await completions.readAll(AGENT_IDS[0])).at(-1)).toMatchObject({
+      helperId: "seen-twice",
+      outcome: "completed",
+      provenance: "adapter-inferred",
+    });
+    expect(manager.listProviderSubagents(AGENT_IDS[0])).toContainEqual(
+      expect.objectContaining({
+        id: "seen-twice",
+        status: "completed",
+        completionEvidence: expect.objectContaining({ outcome: "completed" }),
+      }),
+    );
   });
 });
