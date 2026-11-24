@@ -46,6 +46,18 @@ const journalSchema = z.object({
   recoveryIdentities: z.array(z.string()).default([]),
   recoveryIdentitiesDiscarded: z.number().int().nonnegative().default(0),
   recoveryCursor: z.string().nullable().default(null),
+  projection: z
+    .record(
+      z.string(),
+      z.object({
+        sequence: z.number().int().positive().nullable(),
+        revision: z.number().int().nonnegative(),
+      }),
+    )
+    .default({}),
+  projectionRevision: z.number().int().nonnegative().default(0),
+  projectionVersion: z.literal(1).optional(),
+  projectionDiscarded: z.number().int().nonnegative().default(0),
 });
 type Journal = z.infer<typeof journalSchema>;
 
@@ -176,6 +188,27 @@ export class ProviderSubagentCompletionStore {
     if (this.journal) return this.journal;
     try {
       this.journal = journalSchema.parse(JSON.parse(await readFile(this.file, "utf8")));
+      if (!this.journal.projectionVersion) {
+        const groups = new Map<string, ProviderSubagentCompletion | null>();
+        for (const event of this.journal.events) {
+          if (
+            event.kind !== "completion" ||
+            event.outcome === "unknown" ||
+            event.provenance === "managed-lifecycle"
+          )
+            continue;
+          const key = JSON.stringify([event.parentAgentId, event.provider, event.helperId]);
+          groups.set(key, groups.has(key) ? null : event);
+        }
+        for (const [key, event] of groups) {
+          if (event) this.journal.projection[key] = { sequence: event.sequence, revision: 0 };
+          else {
+            this.journal.projection[key] = { sequence: null, revision: 0 };
+            this.journal.coverageUncertain = true;
+          }
+        }
+        this.journal.projectionVersion = 1;
+      }
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
       this.journal = {
@@ -187,6 +220,10 @@ export class ProviderSubagentCompletionStore {
         recoveryIdentities: [],
         recoveryIdentitiesDiscarded: 0,
         recoveryCursor: null,
+        projection: {},
+        projectionRevision: 0,
+        projectionVersion: 1,
+        projectionDiscarded: 0,
       };
     }
     return this.journal;
@@ -213,6 +250,32 @@ export class ProviderSubagentCompletionStore {
       bytes -= Buffer.byteLength(JSON.stringify(removed));
       next.discardedThrough = removed.sequence;
     }
+    const retained = new Set(next.events.map((event) => event.sequence));
+    if (
+      Object.values(next.projection).some(
+        (value) => value.sequence !== null && !retained.has(value.sequence),
+      )
+    )
+      next.coverageUncertain = true;
+    const projections = Object.entries(next.projection).map(
+      ([key, value]) =>
+        [
+          key,
+          value.sequence !== null && !retained.has(value.sequence)
+            ? { ...value, sequence: null }
+            : value,
+        ] as const,
+    );
+    if (projections.length > 10_000) {
+      projections.sort((a, b) => b[1].revision - a[1].revision);
+      next.projectionDiscarded = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        next.projectionDiscarded + projections.length - 10_000,
+      );
+      projections.length = 10_000;
+      next.coverageUncertain = true;
+    }
+    next.projection = Object.fromEntries(projections);
     next.consumers = Object.fromEntries(
       Object.entries(next.consumers).map(([key, cursor]) => [
         key,
@@ -227,24 +290,61 @@ export class ProviderSubagentCompletionStore {
     this.journal = next;
   }
 
+  private async skipLiveObservation(
+    journal: Journal,
+    parentAgentId: string,
+    provider: AgentProvider,
+    event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+    recovery: boolean,
+    key: string,
+    revision: number,
+  ): Promise<boolean> {
+    if (event.status !== "running" && !isRepeatedSnapshot(journal, parentAgentId, provider, event))
+      return false;
+    if (!recovery) {
+      const sequence =
+        event.status === "running" ? null : (journal.projection[key]?.sequence ?? null);
+      await this.save({
+        ...journal,
+        events: [...journal.events],
+        projectionRevision: revision,
+        projection: { ...journal.projection, [key]: { sequence, revision } },
+      });
+    }
+    return true;
+  }
+
   append(
     parentAgentId: string,
     provider: AgentProvider,
     event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
     provenance = "provider-stream",
     gaps: string[] = [],
+    recovery = false,
   ): Promise<ProviderSubagentCompletion | null> {
-    if (event.status === "running") return Promise.resolve(null);
     return this.serialize(async () => {
       const journal = await this.load();
+      const key = JSON.stringify([parentAgentId, provider, event.id]);
+      const revision = journal.projectionRevision + 1;
+      const historical = recovery || provenance === "managed-lifecycle";
+      if (
+        await this.skipLiveObservation(
+          journal,
+          parentAgentId,
+          provider,
+          event,
+          historical,
+          key,
+          revision,
+        )
+      )
+        return null;
       const outcome = event.status ?? "unknown";
       const identity = sourceIdentity(event, outcome);
-      if (isRepeatedSnapshot(journal, parentAgentId, provider, event)) return null;
       const { sourceEventTime, recordedProvenance, inferredGaps } = describeSource(
         event,
         provenance,
       );
-      const missing = missingEvidence(event, sourceEventTime);
       const deliveryId = randomUUID();
       const eventKey = JSON.stringify([
         parentAgentId,
@@ -255,34 +355,36 @@ export class ProviderSubagentCompletionStore {
       ]);
       const progress = recoveryProgress(journal, eventKey, identity !== null);
       const existing = identity && journal.events.find((entry) => entry.eventKey === eventKey);
-      if (!progress) return existing || null;
-      if (existing) {
-        if (identity) await this.save({ ...journal, events: [...journal.events], ...progress });
-        return existing;
+      if (!progress || existing) {
+        if (!historical && event.status) {
+          await this.save({
+            ...journal,
+            events: [...journal.events],
+            ...progress,
+            projectionRevision: revision,
+            projection: {
+              ...journal.projection,
+              [key]: { sequence: existing?.sequence ?? null, revision },
+            },
+          });
+        } else if (progress && existing) {
+          await this.save({ ...journal, events: [...journal.events], ...progress });
+        }
+        return existing || null;
       }
-      const completion = completionSchema.parse({
-        sequence: journal.nextSequence ?? (journal.events.at(-1)?.sequence ?? 0) + 1,
-        deliveryId,
-        recordedAt: new Date().toISOString(),
-        eventKey,
+      const completion = this.buildCompletion({
+        journal,
+        event,
         parentAgentId,
         provider,
-        helperId: event.id,
-        sourceEventId: event.sourceEventId ?? null,
-        nativeTurnId: event.nativeTurnId ?? null,
-        nativeParentId: event.parentSubagentId ?? null,
-        role: event.role ?? null,
-        sourceEventTime: sourceEventTime ?? null,
-        provenance: recordedProvenance,
+        deliveryId,
+        eventKey,
+        sourceEventTime,
+        recordedProvenance,
         outcome,
-        gaps: [
-          ...this.failedObservationGaps(parentAgentId),
-          ...missing,
-          ...(!identity ? ["deduplication identity unavailable"] : []),
-          ...(outcome === "unknown" ? ["terminal outcome unavailable"] : []),
-          ...inferredGaps,
-          ...gaps,
-        ],
+        identity,
+        inferredGaps,
+        gaps,
       });
       if (Buffer.byteLength(JSON.stringify(completion)) > 64 * 1024)
         throw new Error("Completion exceeds 64 KiB");
@@ -291,9 +393,69 @@ export class ProviderSubagentCompletionStore {
         nextSequence: completion.sequence + 1,
         ...progress,
         events: [...journal.events, completion],
+        projectionRevision:
+          historical || outcome === "unknown" ? journal.projectionRevision : revision,
+        projection:
+          historical || outcome === "unknown"
+            ? journal.projection
+            : { ...journal.projection, [key]: { sequence: completion.sequence, revision } },
       });
       this.failedAppends.delete(parentAgentId);
       return completion;
+    });
+  }
+
+  private buildCompletion(input: {
+    journal: Journal;
+    event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>;
+    parentAgentId: string;
+    provider: AgentProvider;
+    deliveryId: string;
+    eventKey: string;
+    sourceEventTime: string | undefined;
+    recordedProvenance: string;
+    outcome: string;
+    identity: string[] | null;
+    inferredGaps: string[];
+    gaps: string[];
+  }): ProviderSubagentCompletion {
+    const {
+      journal,
+      event,
+      parentAgentId,
+      provider,
+      deliveryId,
+      eventKey,
+      sourceEventTime,
+      recordedProvenance,
+      outcome,
+      identity,
+      inferredGaps,
+      gaps,
+    } = input;
+    return completionSchema.parse({
+      sequence: journal.nextSequence ?? (journal.events.at(-1)?.sequence ?? 0) + 1,
+      deliveryId,
+      recordedAt: new Date().toISOString(),
+      eventKey,
+      parentAgentId,
+      provider,
+      helperId: event.id,
+      sourceEventId: event.sourceEventId ?? null,
+      nativeTurnId: event.nativeTurnId ?? null,
+      nativeParentId: event.parentSubagentId ?? null,
+      role: event.role ?? null,
+      sourceEventTime: sourceEventTime ?? null,
+      provenance: recordedProvenance,
+      outcome,
+      gaps: [
+        ...this.failedObservationGaps(parentAgentId),
+        ...missingEvidence(event, sourceEventTime),
+        ...(!identity ? ["deduplication identity unavailable"] : []),
+        ...(outcome === "unknown" ? ["terminal outcome unavailable"] : []),
+        ...inferredGaps,
+        ...gaps,
+      ],
     });
   }
 
@@ -330,6 +492,49 @@ export class ProviderSubagentCompletionStore {
       if (oldest !== undefined) this.failedAppends.delete(oldest);
       this.failureTrackingOverflowed = true;
     }
+  }
+
+  recoveryWatermark(): Promise<number> {
+    return this.serialize(async () => (await this.load()).projectionRevision);
+  }
+
+  recordRecoveryProjection(
+    parentId: string,
+    watermark: number,
+    completions: { provider: AgentProvider; helperId: string; sequence: number | null }[],
+  ): Promise<void> {
+    return this.serialize(async () => {
+      const journal = await this.load();
+      const projection = { ...journal.projection };
+      const observed = new Set(
+        completions
+          .map((completion) => completion.sequence)
+          .filter((sequence) => sequence !== null),
+      );
+      for (const completion of completions) {
+        const key = JSON.stringify([parentId, completion.provider, completion.helperId]);
+        const current = journal.projection[key];
+        if (
+          journal.projectionRevision === watermark &&
+          ((!current && journal.projectionDiscarded === 0) ||
+            (current?.sequence != null && observed.has(current.sequence)))
+        )
+          projection[key] = { sequence: completion.sequence, revision: watermark };
+      }
+      await this.save({ ...journal, events: [...journal.events], projection });
+    });
+  }
+
+  readProjection(parentAgentId: string): Promise<ProviderSubagentCompletion[]> {
+    return this.serialize(async () => {
+      const journal = await this.load();
+      const events = journal.events.filter((event) => event.parentAgentId === parentAgentId);
+      return events.filter((event) => {
+        const selected =
+          journal.projection[JSON.stringify([event.parentAgentId, event.provider, event.helperId])];
+        return selected !== undefined && event.sequence === selected.sequence;
+      });
+    });
   }
 
   readAll(parentAgentId: string): Promise<ProviderSubagentCompletion[]> {
@@ -398,6 +603,7 @@ export class ProviderSubagentCompletionStore {
       }
       return {
         recoveryIdentitiesDiscarded: journal.recoveryIdentitiesDiscarded,
+        projectionDiscarded: journal.projectionDiscarded,
         coverageUncertain:
           journal.coverageUncertain ||
           this.failedAppends.size > 0 ||

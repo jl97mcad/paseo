@@ -1535,7 +1535,7 @@ export class AgentManager {
     if (!store) return;
     // Rebuild on every registration, including close/reload and history replacement.
     // Acks describe delivery, not whether this process still has its projection.
-    for (const completion of await store.readAll(parentAgentId)) {
+    for (const completion of await store.readProjection(parentAgentId)) {
       if (
         completion.provenance === "managed-lifecycle" ||
         completion.kind !== "completion" ||
@@ -4700,11 +4700,11 @@ export class AgentManager {
         }
       }
 
+      await this.restoreProviderSubagentCompletions(resolvedAgentId);
       this.assertAcceptingAgentRegistrations();
       this.runtimeCleanupIdentities.set(session, Object.freeze({ openedAt: Date.now() }));
       this.agents.set(resolvedAgentId, managed);
       registered = true;
-      await this.restoreProviderSubagentCompletions(resolvedAgentId);
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       if (session.initialTimeline?.length) {
@@ -5315,13 +5315,13 @@ export class AgentManager {
         this.dispatch({ type: "provider_subagent", event });
       }
     }
+    await this.restoreProviderSubagentCompletions(agent.id);
     for (const event of providerSubagentEvents) {
       const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
       if (broadcast) {
         this.dispatch({ type: "provider_subagent", event: update });
       }
     }
-    await this.restoreProviderSubagentCompletions(agent.id);
     for (const entry of historyEntries) {
       const replayed = this.replayProviderHistoryEntry(agent, entry);
       if (replayed && broadcastTimeline) {

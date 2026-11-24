@@ -103,6 +103,8 @@ async function appendHistory(
   store: ProviderSubagentCompletionStore,
   signal: AbortSignal,
 ): Promise<void> {
+  const watermark = await store.recoveryWatermark();
+  const completions = [];
   for await (const event of session.streamHistory()) {
     signal.throwIfAborted();
     if (
@@ -113,6 +115,20 @@ async function appendHistory(
       event.event.status === "running"
     )
       continue;
-    await store.append(parentId, event.provider, event.event, "provider-stream");
+    const completion = await store.append(
+      parentId,
+      event.provider,
+      event.event,
+      "provider-stream",
+      [],
+      true,
+    );
+    completions.push({
+      provider: event.provider,
+      helperId: event.event.id,
+      sequence: completion?.sequence ?? null,
+    });
   }
+  signal.throwIfAborted();
+  await store.recordRecoveryProjection(parentId, watermark, completions);
 }

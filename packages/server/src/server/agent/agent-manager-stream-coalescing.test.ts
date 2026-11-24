@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import pino from "pino";
@@ -18,7 +18,12 @@ import { ProviderSubagentCompletionStore } from "./provider-subagents/completion
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS } from "./agent-stream-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
-import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
+import type {
+  AgentTimelineRow,
+  AgentTimelineStore,
+  AgentTimelineFetchOptions,
+} from "./agent-timeline-store-types.js";
+import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { CodexAppServerAgentSession } from "./providers/codex-app-server-agent.js";
 import {
   createFakeCodexAppServer,
@@ -114,6 +119,66 @@ function toolCall(options?: {
       exitCode: status === "completed" ? 0 : null,
     },
   };
+}
+
+class FileTimelineStore implements AgentTimelineStore {
+  private memory = new InMemoryAgentTimelineStore();
+  constructor(
+    private file: string,
+    private agentId: string,
+  ) {
+    let rows: AgentTimelineRow[] = [];
+    try {
+      rows = JSON.parse(readFileSync(file, "utf8"));
+    } catch (error) {
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
+    this.memory.initialize(agentId, { rows });
+  }
+  private save() {
+    writeFileSync(this.file, JSON.stringify(this.memory.getRows(this.agentId)));
+  }
+  async appendCommitted(
+    id: string,
+    item: AgentTimelineItem,
+    options?: { timestamp?: string; turnId?: string },
+  ) {
+    const row = this.memory.append(id, item, options);
+    this.save();
+    return row;
+  }
+  async fetchCommitted(id: string, options?: AgentTimelineFetchOptions) {
+    return this.memory.fetch(id, options);
+  }
+  async getLatestCommittedSeq(id: string) {
+    return this.memory.getRows(id).at(-1)?.seq ?? 0;
+  }
+  async getCommittedRows(id: string) {
+    return this.memory.getRows(id);
+  }
+  async getLastItem(id: string) {
+    return this.memory.getLastItem(id);
+  }
+  async getLastAssistantMessage(id: string) {
+    return this.memory.getLastAssistantMessage(id);
+  }
+  async deleteAgent(id: string) {
+    this.memory.delete(id);
+    this.memory.initialize(id);
+    this.save();
+  }
+  async bulkInsert(id: string, rows: readonly AgentTimelineRow[]) {
+    for (const row of rows)
+      this.memory.append(id, row.item, { timestamp: row.timestamp, turnId: row.turnId });
+    this.save();
+  }
+  async updateCommittedRow(id: string, row: AgentTimelineRow) {
+    const rows = this.memory.getRows(id);
+    const index = rows.findIndex((entry) => entry.seq === row.seq);
+    if (index >= 0) rows[index] = row;
+    this.memory.initialize(id, { rows });
+    this.save();
+  }
 }
 
 class TestAgentSession implements AgentSession {
@@ -2782,6 +2847,68 @@ test("startup recovery journals source turns for unloaded agents without duplica
       { sequence: 2, nativeTurnId: "turn-two" },
     ]);
 
+    const orderedRoot = join(root, "out-of-order");
+    mkdirSync(orderedRoot);
+    const orderedStore = new ProviderSubagentCompletionStore(orderedRoot);
+    const orderedClient = new TestAgentClient();
+    const orderedLogger = createTestLogger();
+    const orderedStorage = new AgentStorage(join(orderedRoot, "agents"), orderedLogger);
+    const timelineFile = join(root, "timeline.json");
+    const original = new AgentManager({
+      clients: { codex: orderedClient },
+      registry: orderedStorage,
+      durableTimelineStore: new FileTimelineStore(timelineFile, AGENT_IDS[0]),
+      providerSubagentCompletionStore: orderedStore,
+      logger: orderedLogger,
+    });
+    await original.createAgent({ provider: "codex", cwd: orderedRoot }, AGENT_IDS[0], {
+      workspaceId: undefined,
+    });
+    orderedClient.getSession(orderedRoot).pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "child", status: "failed", nativeTurnId: "turn-two" },
+    });
+    await waitForSessionEventQueue();
+    await original.appendTimelineItem(AGENT_IDS[0], {
+      type: "assistant_message",
+      text: "persisted",
+    });
+    await original.flush();
+    await original.closeAgent(AGENT_IDS[0]);
+    await original.flush();
+    await orderedStorage.flush();
+    await recoverCodexHistory([record], client, orderedStore, createTestLogger(), signal);
+    const reopened = new ProviderSubagentCompletionStore(orderedRoot);
+    expect(await reopened.readAll(AGENT_IDS[0])).toMatchObject([
+      { nativeTurnId: "turn-two" },
+      { nativeTurnId: "turn-one" },
+    ]);
+    const restoredStorage = new AgentStorage(join(orderedRoot, "agents"), orderedLogger);
+    const restored = new AgentManager({
+      clients: { codex: new TestAgentClient() },
+      registry: restoredStorage,
+      durableTimelineStore: new FileTimelineStore(timelineFile, AGENT_IDS[0]),
+      providerSubagentCompletionStore: reopened,
+      logger: orderedLogger,
+    });
+    await ensureAgentLoaded(AGENT_IDS[0], {
+      agentManager: restored,
+      agentStorage: restoredStorage,
+      logger: orderedLogger,
+    });
+    expect(await restored.getTimelineRows(AGENT_IDS[0])).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ item: expect.objectContaining({ text: "persisted" }) }),
+      ]),
+    );
+    expect(restored.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+      { id: "child", status: "failed", completionEvidence: { nativeTurnId: "turn-two" } },
+    ]);
+    await restored.closeAgent(AGENT_IDS[0]);
+    await restored.flush();
+    await restoredStorage.flush();
+
     paginated = true;
     const unbound = new ProviderSubagentCompletionStore(join(root, "paginated"));
     await recoverCodexHistory([record], client, unbound, createTestLogger(), signal);
@@ -3526,3 +3653,169 @@ test.each(["timeout", "shutdown"])(
     }
   },
 );
+
+test("forced helper history supersedes retained terminals", async () => {
+  const root = mkdtempSync(join(tmpdir(), "helper-refresh-"));
+  const client = new TestAgentClient();
+  const logger = createTestLogger();
+  const store = new ProviderSubagentCompletionStore(root);
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(root, "agents"), logger),
+    providerSubagentCompletionStore: store,
+    logger,
+  });
+  await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+    workspaceId: undefined,
+  });
+  const session = client.getSession(root);
+  for (const id of ["running", "finished"])
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id, status: "completed", nativeTurnId: "old" },
+    });
+  await waitForSessionEventQueue();
+  session.setHistory([
+    {
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "running", status: "running" },
+    },
+    {
+      type: "provider_subagent",
+      provider: "codex",
+      event: { type: "upsert", id: "finished", status: "failed", nativeTurnId: "new" },
+    },
+  ]);
+  await manager.hydrateTimelineFromProvider(AGENT_IDS[0], { force: true });
+  expect(manager.listProviderSubagents(AGENT_IDS[0])).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: "running", status: "running" }),
+      expect.objectContaining({ id: "finished", status: "failed" }),
+    ]),
+  );
+  expect(
+    manager.listProviderSubagents(AGENT_IDS[0]).find((helper) => helper.id === "running")
+      ?.completionEvidence,
+  ).toBeUndefined();
+  expect(
+    manager.listProviderSubagents(AGENT_IDS[0]).find((helper) => helper.id === "finished")
+      ?.completionEvidence,
+  ).toBeUndefined();
+  await manager.closeAgent(AGENT_IDS[0]);
+  await manager.flush();
+});
+
+test("malformed completion journal closes failed registration and permits retry", async () => {
+  const root = mkdtempSync(join(tmpdir(), "helper-invalid-"));
+  const client = new TestAgentClient();
+  const logger = createTestLogger();
+  const journal = join(root, "provider-subagent-completions.json");
+  writeFileSync(journal, "{");
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: new AgentStorage(join(root, "agents"), logger),
+    providerSubagentCompletionStore: new ProviderSubagentCompletionStore(root),
+    logger,
+  });
+  const close = vi.spyOn(TestAgentSession.prototype, "close");
+  try {
+    await expect(
+      manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+        workspaceId: undefined,
+      }),
+    ).rejects.toThrow();
+    expect(manager.getAgent(AGENT_IDS[0])).toBeNull();
+    expect(close).toHaveBeenCalledOnce();
+    writeFileSync(journal, JSON.stringify({ events: [] }));
+    await manager.createAgent({ provider: "codex", cwd: root }, AGENT_IDS[0], {
+      workspaceId: undefined,
+    });
+    expect(manager.getAgent(AGENT_IDS[0])).not.toBeNull();
+    await manager.closeAgent(AGENT_IDS[0]);
+    await manager.flush();
+  } finally {
+    close.mockRestore();
+  }
+});
+
+test("recovery does not replace a newer live helper with older history", async () => {
+  const root = mkdtempSync(join(tmpdir(), "helper-recovery-race-"));
+  const store = new ProviderSubagentCompletionStore(root);
+  const watermark = await store.recoveryWatermark();
+  await store.append("parent", "codex", { type: "upsert", id: "child", status: "running" });
+  const older = await store.append(
+    "parent",
+    "codex",
+    { type: "upsert", id: "child", status: "completed", nativeTurnId: "opaque" },
+    "provider-stream",
+    [],
+    true,
+  );
+  await store.recordRecoveryProjection("parent", watermark, [
+    { provider: "codex", helperId: "child", sequence: older?.sequence ?? null },
+  ]);
+  expect(await new ProviderSubagentCompletionStore(root).readProjection("parent")).toEqual([]);
+});
+
+test("incomplete history and legacy ordering do not invent a current terminal", async () => {
+  const root = mkdtempSync(join(tmpdir(), "helper-uncertain-"));
+  const store = new ProviderSubagentCompletionStore(root);
+  await store.append("parent", "codex", {
+    type: "upsert",
+    id: "child",
+    status: "failed",
+    nativeTurnId: "later",
+  });
+  const watermark = await store.recoveryWatermark();
+  const old = await store.append(
+    "parent",
+    "codex",
+    { type: "upsert", id: "child", status: "completed", nativeTurnId: "older" },
+    "provider-stream",
+    [],
+    true,
+  );
+  await store.recordRecoveryProjection("parent", watermark, [
+    { provider: "codex", helperId: "child", sequence: old?.sequence ?? null },
+  ]);
+  expect(await store.readProjection("parent")).toMatchObject([
+    { nativeTurnId: "later", outcome: "failed" },
+  ]);
+  const file = join(root, "provider-subagent-completions.json");
+  const raw = JSON.parse(readFileSync(file, "utf8"));
+  delete raw.projectionVersion;
+  delete raw.projection;
+  writeFileSync(file, JSON.stringify(raw));
+  const legacy = new ProviderSubagentCompletionStore(root);
+  expect(await legacy.readAll("parent")).toHaveLength(2);
+  expect(await legacy.readProjection("parent")).toEqual([]);
+  expect((await legacy.consume("parent", "test")).coverageUncertain).toBe(true);
+  const legacyWatermark = await legacy.recoveryWatermark();
+  await legacy.recordRecoveryProjection("parent", legacyWatermark, [
+    { provider: "codex", helperId: "child", sequence: old?.sequence ?? null },
+  ]);
+  expect(await legacy.readProjection("parent")).toEqual([]);
+});
+
+test("projection retention reports discarded current-state markers", async () => {
+  const root = mkdtempSync(join(tmpdir(), "helper-projection-limit-"));
+  const file = join(root, "provider-subagent-completions.json");
+  const projection = Object.fromEntries(
+    Array.from({ length: 10000 }, (_, i) => [
+      JSON.stringify(["parent", "codex", `helper-${i}`]),
+      { sequence: null, revision: i },
+    ]),
+  );
+  writeFileSync(
+    file,
+    JSON.stringify({ events: [], projection, projectionVersion: 1, projectionRevision: 10000 }),
+  );
+  const store = new ProviderSubagentCompletionStore(root);
+  await store.append("parent", "codex", { type: "upsert", id: "new", status: "running" });
+  expect(await store.consume("parent", "test")).toMatchObject({
+    projectionDiscarded: 1,
+    coverageUncertain: true,
+  });
+});

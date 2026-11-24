@@ -105,6 +105,13 @@ function stickyField<T>(next: T | undefined, previous: T | null | undefined): T 
   return next === undefined ? (previous ?? null) : next;
 }
 
+function currentCompletionEvidence(
+  event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+  previous: ProviderSubagentDescriptor | undefined,
+) {
+  return event.completionEvidence ?? (event.status ? undefined : previous?.completionEvidence);
+}
+
 export class ProviderSubagentStore {
   private readonly descriptors = new Map<string, ProviderSubagentDescriptor>();
   private readonly timelines = new InMemoryAgentTimelineStore();
@@ -143,7 +150,7 @@ export class ProviderSubagentStore {
       this.timelines.initialize(key);
     }
     const timestamp = event.timestamp ?? new Date().toISOString();
-    const completionEvidence = event.completionEvidence ?? previous?.completionEvidence;
+    const completionEvidence = currentCompletionEvidence(event, previous);
     const subagent: ProviderSubagentDescriptor = {
       id: event.id,
       parentAgentId,
