@@ -4,7 +4,7 @@ Status: accepted. Supersedes the scheduling and cursor-write decisions in [Conti
 
 ## Decision
 
-Each cycle refreshes the retained parent list and attempts up to 25 parents in sorted cursor order, wrapping as needed. It waits five minutes after the cycle. Failed attempts advance with the batch, so other parents proceed and failures return on a later rotation. A newly added parent enters the next cycle's list. Shutdown leaves the interrupted parent for the next cycle.
+Each cycle refreshes the retained parent list and attempts up to 25 parents in sorted cursor order, wrapping as needed. It waits five minutes after the cycle. Failed attempts advance with the batch, so other parents proceed and failures return on a later rotation. A newly added parent enters the next cycle's list, but is attempted only when the cursor reaches it. An ID at or below the cursor can wait for a full rotation, up to ceil(P / 25) cycles with stable membership. Shutdown leaves the interrupted parent for the next cycle. Each cycle logs completed attempts, deferred parents outside its 25-parent window, total parent count and next cursor. Abort and cursor-write warnings count only the unfinished part of that window. A non-abort delay failure is logged and retries a fresh five-minute delay before the next cycle, so a timer fault does not end recovery.
 
 Save the cursor once after the completed attempts in a cycle. A cursor-write failure or crash can replay up to 25 parents; event identity and the event are persisted together, so retained identities deduplicate the replay. The 10,000-identity shared window can evict identities before replay, and the discarded count exposes that limit. Coverage remains uncertain: a scan cannot prove source retention.
 

@@ -2821,6 +2821,65 @@ test("recovery continues through bounded batches and wraps after journal restart
   expect(seen).toEqual([...records.slice(25), ...records.slice(0, 23)].map((record) => record.id));
 });
 
+test("new parents wait for their position after a persisted recovery cursor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-new-parent-"));
+  const client = new TestAgentClient();
+  const seen: string[] = [];
+  vi.spyOn(client, "resumeSession").mockImplementation(async (_handle, _config, context) => {
+    seen.push(context.agentId);
+    throw new Error("synthetic unavailable history");
+  });
+  function record(index: number) {
+    return parseStoredAgentRecord({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      provider: "codex",
+      cwd: root,
+      createdAt: "2026-01-02T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      persistence: { provider: "codex", sessionId: `thread-${index}` },
+    });
+  }
+  const records = Array.from({ length: 50 }, (_, index) => record(index * 2));
+  const signal = new AbortController().signal;
+  const logger = createTestLogger();
+  const info = vi.spyOn(logger, "info");
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    logger,
+    signal,
+  );
+  expect(seen).toEqual(records.slice(0, 25).map((parent) => parent.id));
+  const before = record(1);
+  const after = record(49);
+  records.push(before, after);
+  seen.length = 0;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    logger,
+    signal,
+  );
+  expect(seen).toEqual([after, ...records.slice(25, 49)].map((parent) => parent.id));
+  expect(info).toHaveBeenLastCalledWith(
+    { attempted: 25, deferred: 27, parentCount: 52, nextCursor: records[48].id },
+    "Codex helper history recovery cycle finished",
+  );
+  seen.length = 0;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    logger,
+    signal,
+  );
+  expect(seen).toEqual(
+    [records[49], records[0], before, ...records.slice(1, 23)].map((parent) => parent.id),
+  );
+});
+
 test("recovery resumes after a cursor write failure and reports it", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-cursor-failure-"));
   const client = new TestAgentClient();
@@ -2875,7 +2934,7 @@ test("recovery stops on abort and resumes from its durable cursor", async () => 
     if (seen.length === 2) controller.abort();
     throw new Error("synthetic unavailable history");
   });
-  const records = Array.from({ length: 3 }, (_, index) =>
+  const records = Array.from({ length: 200 }, (_, index) =>
     parseStoredAgentRecord({
       id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
       provider: "codex",
@@ -2899,6 +2958,10 @@ test("recovery stops on abort and resumes from its durable cursor", async () => 
     "Codex helper history recovery incomplete",
   );
   expect(seen).toEqual([records[0].id, records[1].id]);
+  expect(warning).toHaveBeenCalledWith(
+    { skipped: 24 },
+    "Codex helper history recovery stopped early",
+  );
   seen.length = 0;
   await recoverCodexHistory(
     records,
@@ -2907,7 +2970,7 @@ test("recovery stops on abort and resumes from its durable cursor", async () => 
     createTestLogger(),
     new AbortController().signal,
   );
-  expect(seen).toEqual([records[1].id, records[2].id, records[0].id]);
+  expect(seen).toEqual(records.slice(1, 26).map((record) => record.id));
 });
 
 test("failed journal write persists neither identity nor event", async () => {

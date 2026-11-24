@@ -33,9 +33,11 @@ export async function recoverCodexHistory(
   const start = cursor ? candidates.findIndex((record) => record.id > cursor) : 0;
   const ordered =
     start < 0 ? candidates : [...candidates.slice(start), ...candidates.slice(0, start)];
+  const window = ordered.slice(0, 25);
+  const deferred = ordered.length - window.length;
   let attempted = 0;
   let lastAttempted: string | undefined;
-  for (const record of ordered.slice(0, 25)) {
+  for (const record of window) {
     if (signal.aborted) break;
     const handle = record.persistence;
     if (!handle) continue;
@@ -61,20 +63,24 @@ export async function recoverCodexHistory(
     lastAttempted = record.id;
     attempted++;
   }
+  logger.info(
+    { attempted, deferred, parentCount: candidates.length, nextCursor: lastAttempted ?? cursor },
+    "Codex helper history recovery cycle finished",
+  );
   if (lastAttempted) {
     try {
       await store.advanceRecoveryCursor(lastAttempted);
     } catch (err) {
       logger.warn(
-        { err, agentId: lastAttempted, skipped: ordered.length - attempted },
+        { err, agentId: lastAttempted, skipped: window.length - attempted },
         "Codex helper history recovery cursor write failed",
       );
       throw err;
     }
   }
-  if (signal.aborted && attempted < ordered.length)
+  if (signal.aborted && attempted < window.length)
     logger.warn(
-      { skipped: ordered.length - attempted },
+      { skipped: window.length - attempted },
       "Codex helper history recovery stopped early",
     );
 }

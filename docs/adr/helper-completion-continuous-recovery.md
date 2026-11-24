@@ -1,6 +1,6 @@
 # Continuous Codex helper recovery
 
-Status: accepted. Supersedes the startup-only scheduling and limits in [Codex helper completion history recovery](helper-completion-codex-recovery.md). Its identity and evidence rules still apply.
+Status: superseded in part by [Batched Codex helper recovery](helper-completion-batched-recovery.md). Supersedes the startup-only scheduling and limits in [Codex helper completion history recovery](helper-completion-codex-recovery.md). Its identity and evidence rules still apply.
 
 ## Decision
 

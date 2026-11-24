@@ -1987,14 +1987,15 @@ export async function createPaseoDaemon(
                 } catch (err) {
                   logger.warn({ err }, "Codex helper history recovery failed");
                 }
-                try {
-                  await delay(5 * 60_000, undefined, { signal: helperRecoveryAbort.signal });
-                } catch (err) {
-                  if (!helperRecoveryAbort.signal.aborted) {
-                    logger.warn({ err }, "Codex helper history recovery delay failed");
+                do {
+                  try {
+                    await delay(5 * 60_000, undefined, { signal: helperRecoveryAbort.signal });
                     break;
+                  } catch (err) {
+                    if (!helperRecoveryAbort.signal.aborted)
+                      logger.warn({ err }, "Codex helper history recovery delay failed");
                   }
-                }
+                } while (!helperRecoveryAbort.signal.aborted);
               }
             })();
             restartRecovery.resumePending();
