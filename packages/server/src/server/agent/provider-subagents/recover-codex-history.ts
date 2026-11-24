@@ -1,4 +1,3 @@
-import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { AgentClient, AgentSession } from "../agent-sdk-types.js";
 import type { StoredAgentRecord } from "../agent-storage.js";
@@ -24,7 +23,7 @@ export async function recoverCodexHistory(
     logger.warn({ skipped: candidates.length }, "Codex helper history recovery unavailable");
     return;
   }
-  // Pause between batches to bound history load on the provider.
+  // Bound each cycle; the next cycle refreshes the list and resumes at the cursor.
   candidates.sort((a, b) => {
     if (a.id < b.id) return -1;
     if (a.id > b.id) return 1;
@@ -35,15 +34,8 @@ export async function recoverCodexHistory(
   const ordered =
     start < 0 ? candidates : [...candidates.slice(start), ...candidates.slice(0, start)];
   let attempted = 0;
-  for (const record of ordered) {
-    if (attempted > 0 && attempted % 25 === 0) {
-      try {
-        await delay(1_000, undefined, { signal });
-      } catch (err) {
-        if (signal.aborted) break;
-        throw err;
-      }
-    }
+  let lastAttempted: string | undefined;
+  for (const record of ordered.slice(0, 25)) {
     if (signal.aborted) break;
     const handle = record.persistence;
     if (!handle) continue;
@@ -62,19 +54,23 @@ export async function recoverCodexHistory(
         await session.close();
       }
     } catch (err) {
-      logger.warn({ err, agentId: record.id }, "Codex helper history recovery incomplete");
+      if (!signal.aborted)
+        logger.warn({ err, agentId: record.id }, "Codex helper history recovery incomplete");
     }
     if (signal.aborted) break;
+    lastAttempted = record.id;
+    attempted++;
+  }
+  if (lastAttempted) {
     try {
-      await store.advanceRecoveryCursor(record.id);
+      await store.advanceRecoveryCursor(lastAttempted);
     } catch (err) {
       logger.warn(
-        { err, agentId: record.id, skipped: ordered.length - attempted - 1 },
+        { err, agentId: lastAttempted, skipped: ordered.length - attempted },
         "Codex helper history recovery cursor write failed",
       );
       throw err;
     }
-    attempted++;
   }
   if (signal.aborted && attempted < ordered.length)
     logger.warn(

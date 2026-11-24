@@ -2729,6 +2729,11 @@ test("startup recovery journals source turns for unloaded agents without duplica
         sourceEventTime: "2026-01-02T03:05:05.000Z",
       },
     ]);
+    const interrupted = new ProviderSubagentCompletionStore(root);
+    vi.spyOn(interrupted, "advanceRecoveryCursor").mockRejectedValueOnce(new Error("cursor lost"));
+    await expect(
+      recoverCodexHistory([record], client, interrupted, createTestLogger(), signal),
+    ).rejects.toThrow("cursor lost");
     await recoverCodexHistory([record], client, restarted, createTestLogger(), signal);
     expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[0])).toHaveLength(2);
     expect((await restarted.consume(AGENT_IDS[0], "recovery")).coverageUncertain).toBe(true);
@@ -2804,7 +2809,7 @@ test("recovery continues through bounded batches and wraps after journal restart
     createTestLogger(),
     signal,
   );
-  expect(seen).toEqual(records.map((record) => record.id));
+  expect(seen).toEqual(records.slice(0, 25).map((record) => record.id));
   seen.length = 0;
   await recoverCodexHistory(
     records,
@@ -2813,7 +2818,7 @@ test("recovery continues through bounded batches and wraps after journal restart
     createTestLogger(),
     signal,
   );
-  expect(seen).toEqual(records.map((record) => record.id));
+  expect(seen).toEqual([...records.slice(25), ...records.slice(0, 23)].map((record) => record.id));
 });
 
 test("recovery resumes after a cursor write failure and reports it", async () => {
@@ -2837,7 +2842,7 @@ test("recovery resumes after a cursor write failure and reports it", async () =>
   const store = new ProviderSubagentCompletionStore(root);
   const advance = store.advanceRecoveryCursor.bind(store);
   vi.spyOn(store, "advanceRecoveryCursor").mockImplementation(async (id) => {
-    if (id === records[1].id) throw new Error("synthetic cursor failure");
+    if (id === records[2].id) throw new Error("synthetic cursor failure");
     await advance(id);
   });
   const logger = createTestLogger();
@@ -2846,7 +2851,7 @@ test("recovery resumes after a cursor write failure and reports it", async () =>
     recoverCodexHistory(records, client, store, logger, new AbortController().signal),
   ).rejects.toThrow("synthetic cursor failure");
   expect(warning).toHaveBeenCalledWith(
-    expect.objectContaining({ skipped: 1 }),
+    expect.objectContaining({ skipped: 0 }),
     "Codex helper history recovery cursor write failed",
   );
   seen.length = 0;
@@ -2857,7 +2862,7 @@ test("recovery resumes after a cursor write failure and reports it", async () =>
     logger,
     new AbortController().signal,
   );
-  expect(seen).toEqual([records[1].id, records[2].id, records[0].id]);
+  expect(seen).toEqual(records.map((record) => record.id));
 });
 
 test("recovery stops on abort and resumes from its durable cursor", async () => {
@@ -2880,12 +2885,18 @@ test("recovery stops on abort and resumes from its durable cursor", async () => 
       persistence: { provider: "codex", sessionId: `thread-${index}` },
     }),
   );
+  const logger = createTestLogger();
+  const warning = vi.spyOn(logger, "warn");
   await recoverCodexHistory(
     records,
     client,
     new ProviderSubagentCompletionStore(root),
-    createTestLogger(),
+    logger,
     controller.signal,
+  );
+  expect(warning).not.toHaveBeenCalledWith(
+    expect.objectContaining({ agentId: records[1].id }),
+    "Codex helper history recovery incomplete",
   );
   expect(seen).toEqual([records[0].id, records[1].id]);
   seen.length = 0;
@@ -2897,6 +2908,24 @@ test("recovery stops on abort and resumes from its durable cursor", async () => 
     new AbortController().signal,
   );
   expect(seen).toEqual([records[1].id, records[2].id, records[0].id]);
+});
+
+test("failed journal write persists neither identity nor event", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-atomic-"));
+  const event = {
+    type: "upsert" as const,
+    id: "child",
+    status: "completed" as const,
+    nativeTurnId: "turn",
+  };
+  const failing = new ProviderSubagentCompletionStore(root, 10000, async () => {
+    throw new Error("write failed");
+  });
+  await expect(failing.append("parent", "codex", event)).rejects.toThrow("write failed");
+  const restarted = new ProviderSubagentCompletionStore(root);
+  expect(await restarted.readAll("parent")).toEqual([]);
+  await restarted.append("parent", "codex", event);
+  expect(await new ProviderSubagentCompletionStore(root).readAll("parent")).toHaveLength(1);
 });
 
 test("identity eviction reports the deduplication limit after restart", async () => {

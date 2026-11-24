@@ -1990,7 +1990,10 @@ export async function createPaseoDaemon(
                 try {
                   await delay(5 * 60_000, undefined, { signal: helperRecoveryAbort.signal });
                 } catch (err) {
-                  if (!helperRecoveryAbort.signal.aborted) throw err;
+                  if (!helperRecoveryAbort.signal.aborted) {
+                    logger.warn({ err }, "Codex helper history recovery delay failed");
+                    break;
+                  }
                 }
               }
             })();

@@ -1,0 +1,11 @@
+# Batched Codex helper recovery
+
+Status: accepted. Supersedes the scheduling and cursor-write decisions in [Continuous Codex helper recovery](helper-completion-continuous-recovery.md). Its coverage and identity limits still apply.
+
+## Decision
+
+Each cycle refreshes the retained parent list and attempts up to 25 parents in sorted cursor order, wrapping as needed. It waits five minutes after the cycle. Failed attempts advance with the batch, so other parents proceed and failures return on a later rotation. A newly added parent enters the next cycle's list. Shutdown leaves the interrupted parent for the next cycle.
+
+Save the cursor once after the completed attempts in a cycle. A cursor-write failure or crash can replay up to 25 parents; event identity and the event are persisted together, so retained identities deduplicate the replay. The 10,000-identity shared window can evict identities before replay, and the discarded count exposes that limit. Coverage remains uncertain: a scan cannot prove source retention.
+
+For P eligible parents, journal snapshot size J bytes, and E newly accepted events in a cycle, the cycle opens at most min(P, 25) history sessions and rewrites approximately (1 + E) × J bytes: one cursor snapshot plus one per accepted event. The first uncertainty marker can add one snapshot. Snapshot sizes vary during the cycle, and provider history cost depends on its size. For example, P = 200, J = 4 MiB and E = 0 give at most 25 sessions and about 4 MiB per cycle, versus 200 sessions and about 800 MiB of cursor writes before this decision. A full rotation takes at least ceil(P / 25) cycles plus their execution time; continuously changing membership can change that estimate. The bound trades recovery latency for lower recurring work.
