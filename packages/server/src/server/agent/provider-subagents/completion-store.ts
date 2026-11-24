@@ -55,8 +55,8 @@ function sourceIdentity(
   return null;
 }
 
-function recoveryProgress(journal: Journal, eventKey: string, recovered: boolean) {
-  if (!recovered)
+function recoveryProgress(journal: Journal, eventKey: string, hasIdentity: boolean) {
+  if (!hasIdentity)
     return {
       recoveryIdentities: journal.recoveryIdentities,
       recoveryIdentitiesDiscarded: journal.recoveryIdentitiesDiscarded,

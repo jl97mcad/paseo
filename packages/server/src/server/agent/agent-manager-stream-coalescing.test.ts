@@ -2778,7 +2778,7 @@ test("startup recovery journals source turns for unloaded agents without duplica
   }
 });
 
-test("recovery scans a bounded rotating batch across journal restarts", async () => {
+test("recovery continues through bounded batches and wraps after journal restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-scan-"));
   const client = new TestAgentClient();
   const seen: string[] = [];
@@ -2804,7 +2804,7 @@ test("recovery scans a bounded rotating batch across journal restarts", async ()
     createTestLogger(),
     signal,
   );
-  expect(seen).toEqual(records.slice(0, 25).map((record) => record.id));
+  expect(seen).toEqual(records.map((record) => record.id));
   seen.length = 0;
   await recoverCodexHistory(
     records,
@@ -2813,8 +2813,90 @@ test("recovery scans a bounded rotating batch across journal restarts", async ()
     createTestLogger(),
     signal,
   );
-  expect(seen.slice(0, 2)).toEqual(records.slice(25).map((record) => record.id));
-  expect(seen).toHaveLength(25);
+  expect(seen).toEqual(records.map((record) => record.id));
+});
+
+test("recovery resumes after a cursor write failure and reports it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-cursor-failure-"));
+  const client = new TestAgentClient();
+  const seen: string[] = [];
+  vi.spyOn(client, "resumeSession").mockImplementation(async (_handle, _config, context) => {
+    seen.push(context.agentId);
+    throw new Error("synthetic unavailable history");
+  });
+  const records = Array.from({ length: 3 }, (_, index) =>
+    parseStoredAgentRecord({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      provider: "codex",
+      cwd: root,
+      createdAt: "2026-01-02T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      persistence: { provider: "codex", sessionId: `thread-${index}` },
+    }),
+  );
+  const store = new ProviderSubagentCompletionStore(root);
+  const advance = store.advanceRecoveryCursor.bind(store);
+  vi.spyOn(store, "advanceRecoveryCursor").mockImplementation(async (id) => {
+    if (id === records[1].id) throw new Error("synthetic cursor failure");
+    await advance(id);
+  });
+  const logger = createTestLogger();
+  const warning = vi.spyOn(logger, "warn");
+  await expect(
+    recoverCodexHistory(records, client, store, logger, new AbortController().signal),
+  ).rejects.toThrow("synthetic cursor failure");
+  expect(warning).toHaveBeenCalledWith(
+    expect.objectContaining({ skipped: 1 }),
+    "Codex helper history recovery cursor write failed",
+  );
+  seen.length = 0;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    logger,
+    new AbortController().signal,
+  );
+  expect(seen).toEqual([records[1].id, records[2].id, records[0].id]);
+});
+
+test("recovery stops on abort and resumes from its durable cursor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-abort-"));
+  const client = new TestAgentClient();
+  const controller = new AbortController();
+  const seen: string[] = [];
+  vi.spyOn(client, "resumeSession").mockImplementation(async (_handle, _config, context) => {
+    seen.push(context.agentId);
+    if (seen.length === 2) controller.abort();
+    throw new Error("synthetic unavailable history");
+  });
+  const records = Array.from({ length: 3 }, (_, index) =>
+    parseStoredAgentRecord({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      provider: "codex",
+      cwd: root,
+      createdAt: "2026-01-02T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      persistence: { provider: "codex", sessionId: `thread-${index}` },
+    }),
+  );
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    createTestLogger(),
+    controller.signal,
+  );
+  expect(seen).toEqual([records[0].id, records[1].id]);
+  seen.length = 0;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    createTestLogger(),
+    new AbortController().signal,
+  );
+  expect(seen).toEqual([records[1].id, records[2].id, records[0].id]);
 });
 
 test("identity eviction reports the deduplication limit after restart", async () => {

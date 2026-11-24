@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import type { Logger } from "pino";
 import type { AgentClient, AgentSession } from "../agent-sdk-types.js";
 import type { StoredAgentRecord } from "../agent-storage.js";
@@ -23,7 +24,7 @@ export async function recoverCodexHistory(
     logger.warn({ skipped: candidates.length }, "Codex helper history recovery unavailable");
     return;
   }
-  // ponytail: 25 parents per startup; revisit in sorted rotation on later starts.
+  // Pause between batches to bound history load on the provider.
   candidates.sort((a, b) => {
     if (a.id < b.id) return -1;
     if (a.id > b.id) return 1;
@@ -33,9 +34,16 @@ export async function recoverCodexHistory(
   const start = cursor ? candidates.findIndex((record) => record.id > cursor) : 0;
   const ordered =
     start < 0 ? candidates : [...candidates.slice(start), ...candidates.slice(0, start)];
-  const batch = ordered.slice(0, 25);
-  let remaining = candidates.length;
-  for (const record of batch) {
+  let attempted = 0;
+  for (const record of ordered) {
+    if (attempted > 0 && attempted % 25 === 0) {
+      try {
+        await delay(1_000, undefined, { signal });
+      } catch (err) {
+        if (signal.aborted) break;
+        throw err;
+      }
+    }
     if (signal.aborted) break;
     const handle = record.persistence;
     if (!handle) continue;
@@ -57,10 +65,22 @@ export async function recoverCodexHistory(
       logger.warn({ err, agentId: record.id }, "Codex helper history recovery incomplete");
     }
     if (signal.aborted) break;
-    await store.advanceRecoveryCursor(record.id);
-    remaining--;
+    try {
+      await store.advanceRecoveryCursor(record.id);
+    } catch (err) {
+      logger.warn(
+        { err, agentId: record.id, skipped: ordered.length - attempted - 1 },
+        "Codex helper history recovery cursor write failed",
+      );
+      throw err;
+    }
+    attempted++;
   }
-  if (remaining) logger.warn({ skipped: remaining }, "Codex helper history recovery stopped early");
+  if (signal.aborted && attempted < ordered.length)
+    logger.warn(
+      { skipped: ordered.length - attempted },
+      "Codex helper history recovery stopped early",
+    );
 }
 
 async function appendHistory(

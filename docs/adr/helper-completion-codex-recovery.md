@@ -1,6 +1,6 @@
 # Codex helper completion history recovery
 
-Status: accepted. Extends [Helper completion coverage warning](helper-completion-coverage.md) and supersedes the statement in [Durable helper observations and consumers](helper-completion-consumers.md) that source events which never arrive cannot be reconstructed.
+Status: superseded in part by [Continuous Codex helper recovery](helper-completion-continuous-recovery.md). Extends [Helper completion coverage warning](helper-completion-coverage.md) and supersedes the statement in [Durable helper observations and consumers](helper-completion-consumers.md) that source events which never arrive cannot be reconstructed.
 
 ## Decision
 

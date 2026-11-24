@@ -18,6 +18,7 @@ import { createServer as createHTTPServer, type IncomingMessage, type ServerResp
 import { constants, existsSync, unlinkSync } from "fs";
 import { open, rm, stat } from "fs/promises";
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { getHostName } from "./host-name.js";
 import path from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -1973,13 +1974,26 @@ export async function createPaseoDaemon(
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
             providerSnapshotManager.settlePluginProviders();
-            helperRecovery = recoverCodexHistory(
-              persistedRecords,
-              providerSnapshotManager.getAgentManagerProviderState().clients.codex,
-              completionStore,
-              logger,
-              helperRecoveryAbort.signal,
-            ).catch((err) => logger.warn({ err }, "Codex helper history recovery failed"));
+            helperRecovery = (async () => {
+              while (!helperRecoveryAbort.signal.aborted) {
+                try {
+                  await recoverCodexHistory(
+                    await agentStorage.listAll(),
+                    providerSnapshotManager.getAgentManagerProviderState().clients.codex,
+                    completionStore,
+                    logger,
+                    helperRecoveryAbort.signal,
+                  );
+                } catch (err) {
+                  logger.warn({ err }, "Codex helper history recovery failed");
+                }
+                try {
+                  await delay(5 * 60_000, undefined, { signal: helperRecoveryAbort.signal });
+                } catch (err) {
+                  if (!helperRecoveryAbort.signal.aborted) throw err;
+                }
+              }
+            })();
             restartRecovery.resumePending();
             await finishSubscriptions.start();
             await changeRequestWatches.start();
