@@ -50,10 +50,22 @@ export async function recoverCodexHistory(
         { agentId: record.id, env: record.launchEnv },
         { purpose: "history", signal: attempt },
       );
+      let closing: Promise<void> | undefined;
+      const close = () => {
+        closing ??= session.close();
+        return closing;
+      };
+      const abort = () => {
+        void close().catch(() => {});
+      };
+      attempt.addEventListener("abort", abort, { once: true });
       try {
+        if (attempt.aborted) abort();
+        attempt.throwIfAborted();
         await appendHistory(session, record.id, store, attempt);
       } finally {
-        await session.close();
+        attempt.removeEventListener("abort", abort);
+        await close();
       }
     } catch (err) {
       if (!signal.aborted)

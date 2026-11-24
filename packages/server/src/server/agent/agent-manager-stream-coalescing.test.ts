@@ -3453,3 +3453,76 @@ describe("adapter-inferred helper terminals", () => {
     );
   });
 });
+
+test.each(["timeout", "shutdown"])(
+  "recovery closes a stalled history read on %s",
+  async (reason) => {
+    const root = mkdtempSync(join(tmpdir(), "codex-stalled-"));
+    const client = new TestAgentClient();
+    const timeout = new AbortController();
+    const shutdown = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValueOnce(timeout.signal);
+    const servers: ReturnType<typeof createFakeCodexAppServer>[] = [];
+    const sessions: CodexAppServerAgentSession[] = [];
+    const seen: string[] = [];
+    vi.spyOn(client, "resumeSession").mockImplementation(async (_handle, _config, context) => {
+      seen.push(context.agentId);
+      const server = createFakeCodexAppServer(
+        seen.length === 1 ? { "thread/read": () => new Promise(() => {}) } : {},
+      );
+      servers.push(server);
+      const session = new CodexAppServerAgentSession(
+        { provider: "codex", cwd: root },
+        { sessionId: "parent-thread" },
+        createTestLogger(),
+        async () => server.child,
+      );
+      sessions.push(session);
+      await session.getRuntimeInfo();
+      return session;
+    });
+    const records = [0, 1].map((index) =>
+      parseStoredAgentRecord({
+        id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        provider: "codex",
+        cwd: root,
+        createdAt: "2026-01-02T00:00:00.000Z",
+        updatedAt: "2026-01-02T00:00:00.000Z",
+        persistence: { provider: "codex", sessionId: "parent-thread" },
+      }),
+    );
+    const store = new ProviderSubagentCompletionStore(root);
+    let cycle: Promise<void> | undefined;
+    try {
+      cycle = recoverCodexHistory(records, client, store, createTestLogger(), shutdown.signal);
+      while (!servers.length) await new Promise((resolve) => setTimeout(resolve, 1));
+      await servers[0].waitForRequest("thread/read");
+      (reason === "timeout" ? timeout : shutdown).abort();
+      await Promise.race([
+        cycle,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("recovery stalled")), 200),
+        ),
+      ]);
+      expect(seen).toEqual(
+        reason === "timeout" ? records.map((record) => record.id) : [records[0].id],
+      );
+      expect(await store.recoveryCursor()).toBe(reason === "timeout" ? records[1].id : null);
+      if (reason === "shutdown") {
+        await recoverCodexHistory(
+          records,
+          client,
+          store,
+          createTestLogger(),
+          new AbortController().signal,
+        );
+        expect(seen.slice(1)).toEqual(records.map((record) => record.id));
+      }
+    } finally {
+      timeoutSpy.mockRestore();
+      for (const session of sessions) await session.close();
+      await cycle;
+      for (const server of servers) server.disconnect();
+    }
+  },
+);
