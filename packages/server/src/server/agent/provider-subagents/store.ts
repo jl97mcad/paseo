@@ -42,7 +42,8 @@ export interface ProviderSubagentDescriptor {
  * as a task canceled because its turn ended or a state read that found a child idle. Internal to
  * the daemon: the descriptor and the wire never carry it, the journal records it as provenance.
  * `snapshot` marks a re-read of current state rather than a transition, so repeating the read
- * adds nothing once the helper has a terminal on record.
+ * adds nothing when the latest retained completion is an inferred snapshot with the same outcome.
+ * A native terminal or an inferred non-snapshot does not suppress the next snapshot.
  */
 export interface ProviderSubagentInferredOutcome {
   reason: string;

@@ -3154,85 +3154,125 @@ describe("adapter-inferred helper terminals", () => {
     return { root, completions, manager };
   }
 
-  test("journals Claude's synthesized cancel and failure apart from a native settle", async () => {
-    const client = new TestAgentClient();
-    const { root, completions, manager } = await setup("codex", { codex: client });
-    const source = new ClaudeTaskProtocolSource();
-    const started = (id: string, task: string) =>
-      ({
-        type: "system",
-        subtype: "task_started",
-        task_id: task,
-        tool_use_id: id,
-        description: id,
-        subagent_type: "general-purpose",
-        task_type: "local_agent",
-      }) as unknown as SDKMessage;
-    const session = client.getSession(root);
-    const push = (observations: SubagentObservation[]) => {
-      for (const event of foldSubagentObservations(observations))
-        session.pushEvent({ type: "provider_subagent", provider: "claude", event });
-    };
-    push(source.observe(started("toolu_native", "task-native")));
-    push(
-      source.observe({
-        type: "system",
-        subtype: "task_notification",
-        task_id: "task-native",
-        tool_use_id: "toolu_native",
-        status: "completed",
-      } as unknown as SDKMessage),
-    );
-    push(source.observe(started("toolu_canceled", "task-canceled")));
-    push(source.cancelRunningForegroundTasks());
-    push(source.observe(started("toolu_failed", "task-failed")));
-    push(source.failRunningTasks());
-    await waitForSessionEventQueue();
-    await manager.flush();
+  test.each(["disk rehydration", "history replacement"] as const)(
+    "restores Claude native and inferred terminals from an empty descriptor store after %s",
+    async (path) => {
+      const client = new TestAgentClient();
+      const { root, completions, manager } = await setup("codex", { codex: client });
+      const source = new ClaudeTaskProtocolSource();
+      const started = (id: string, task: string) =>
+        ({
+          type: "system",
+          subtype: "task_started",
+          task_id: task,
+          tool_use_id: id,
+          description: id,
+          subagent_type: "general-purpose",
+          task_type: "local_agent",
+        }) as unknown as SDKMessage;
+      const session = client.getSession(root);
+      const push = (observations: SubagentObservation[]) => {
+        for (const event of foldSubagentObservations(observations))
+          session.pushEvent({ type: "provider_subagent", provider: "claude", event });
+      };
+      push(source.observe(started("toolu_native", "task-native")));
+      push(
+        source.observe({
+          type: "system",
+          subtype: "task_notification",
+          task_id: "task-native",
+          tool_use_id: "toolu_native",
+          status: "completed",
+        } as unknown as SDKMessage),
+      );
+      push(source.observe(started("toolu_canceled", "task-canceled")));
+      push(source.cancelRunningForegroundTasks());
+      push(source.observe(started("toolu_failed", "task-failed")));
+      push(source.failRunningTasks());
+      await waitForSessionEventQueue();
+      await manager.flush();
 
-    const journal = await completions.readAll(AGENT_IDS[0]);
-    expect(
-      journal.map(({ helperId, outcome, provenance, sourceEventTime }) => ({
-        helperId,
-        outcome,
-        provenance,
-        sourceEventTime,
-      })),
-    ).toEqual([
-      {
-        helperId: "toolu_native",
-        outcome: "completed",
-        provenance: "provider-stream",
-        sourceEventTime: null,
-      },
-      {
-        helperId: "toolu_canceled",
-        outcome: "canceled",
-        provenance: "adapter-inferred",
-        sourceEventTime: null,
-      },
-      {
-        helperId: "toolu_failed",
-        outcome: "failed",
-        provenance: "adapter-inferred",
-        sourceEventTime: null,
-      },
-    ]);
-    expect(journal[0]?.gaps).not.toContain("outcome inferred by adapter");
-    expect(journal[1]?.gaps).toContain(
-      "outcome inferred by adapter: foreground task still running: turn canceled",
-    );
-    expect(journal[2]?.gaps).toContain(
-      "outcome inferred by adapter: Claude process lost while the task was running",
-    );
-    await manager.reloadAgentSession(AGENT_IDS[0]);
-    // Reload reconstructs inferred outcomes from the journal.
-    expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
-      { id: "toolu_native", status: "completed" },
-      { id: "toolu_canceled", status: "canceled" },
-      { id: "toolu_failed", status: "failed" },
-    ]);
-  });
+      const journal = await completions.readAll(AGENT_IDS[0]);
+      expect(
+        journal.map(({ helperId, outcome, provenance, sourceEventTime }) => ({
+          helperId,
+          outcome,
+          provenance,
+          sourceEventTime,
+        })),
+      ).toEqual([
+        {
+          helperId: "toolu_native",
+          outcome: "completed",
+          provenance: "provider-stream",
+          sourceEventTime: null,
+        },
+        {
+          helperId: "toolu_canceled",
+          outcome: "canceled",
+          provenance: "adapter-inferred",
+          sourceEventTime: null,
+        },
+        {
+          helperId: "toolu_failed",
+          outcome: "failed",
+          provenance: "adapter-inferred",
+          sourceEventTime: null,
+        },
+      ]);
+      expect(journal[0]?.gaps).not.toContain("outcome inferred by adapter");
+      expect(journal[1]?.gaps).toContain(
+        "outcome inferred by adapter: foreground task still running: turn canceled",
+      );
+      expect(journal[2]?.gaps).toContain(
+        "outcome inferred by adapter: Claude process lost while the task was running",
+      );
+      const removedHelpers: string[] = [];
+      const unsubscribe = manager.subscribe(
+        (event) => {
+          if (event.type === "provider_subagent" && event.event.type === "remove") {
+            removedHelpers.push(event.event.subagentId);
+          }
+        },
+        { replayState: false },
+      );
+      // Neither replacement supplies helper history; only the retained journal can restore them.
+      session.setHistory([]);
+      try {
+        if (path === "disk rehydration") {
+          await manager.reloadAgentSession(AGENT_IDS[0], undefined, { rehydrateFromDisk: true });
+        } else {
+          await manager.hydrateTimelineFromProvider(AGENT_IDS[0], { force: true, broadcast: true });
+        }
+      } finally {
+        unsubscribe();
+      }
+      expect(removedHelpers).toEqual(["toolu_native", "toolu_canceled", "toolu_failed"]);
+      expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+        { id: "toolu_native", status: "completed" },
+        {
+          id: "toolu_canceled",
+          status: "canceled",
+          completionEvidence: {
+            provenance: "adapter-inferred",
+            outcome: "canceled",
+            sourceEventId: null,
+            sourceEventTime: null,
+          },
+        },
+        {
+          id: "toolu_failed",
+          status: "failed",
+          completionEvidence: {
+            provenance: "adapter-inferred",
+            outcome: "failed",
+            sourceEventId: null,
+            sourceEventTime: null,
+          },
+        },
+      ]);
+    },
+  );
 
   test("journals OMP's interrupt-synthesized cancel apart from a native lifecycle outcome", async () => {
     const runtime = new FakeOmp();
@@ -3351,7 +3391,7 @@ describe("adapter-inferred helper terminals", () => {
     }
   });
 
-  test("a re-read state snapshot journals once per helper, and never after a recorded terminal", async () => {
+  test("snapshots deduplicate by latest inferred snapshot outcome and preserve native terminals", async () => {
     const client = new TestAgentClient();
     const { root, completions, manager } = await setup("codex", { codex: client });
     const session = client.getSession(root);
