@@ -85,6 +85,8 @@ function countChildStatuses(
 }
 
 const TEST_MODEL = "opencode/big-pickle";
+// Pins the producer's exact reason: a child read as not busy is inferred completed from the snapshot.
+const IDLE_CHILD_INFERRED = { reason: "child not busy when the session was read", snapshot: true };
 
 function createDirectEventSource(client: OpencodeClient): OpenCodeEventSource {
   const listeners = new Set<(input: never) => void>();
@@ -6317,6 +6319,7 @@ describe("OpenCode provider subagent contract", () => {
           parentSubagentId: null,
           description: "Child A",
           status: "completed",
+          inferred: IDLE_CHILD_INFERRED,
         },
       },
       {
@@ -6328,6 +6331,7 @@ describe("OpenCode provider subagent contract", () => {
           parentSubagentId: null,
           description: "Child B",
           status: "completed",
+          inferred: IDLE_CHILD_INFERRED,
         },
       },
       {
@@ -6339,6 +6343,7 @@ describe("OpenCode provider subagent contract", () => {
           parentSubagentId: "ses_child_a",
           description: "Grandchild A",
           status: "completed",
+          inferred: IDLE_CHILD_INFERRED,
         },
       },
     ]);
@@ -6402,6 +6407,7 @@ describe("OpenCode provider subagent contract", () => {
         parentSubagentId: null,
         description: "Historical child",
         status: "completed",
+        inferred: IDLE_CHILD_INFERRED,
         cwd: "/workspace/child",
       },
     });
@@ -6490,6 +6496,7 @@ describe("OpenCode provider subagent contract", () => {
         parentSubagentId: null,
         description: "Chase the regression",
         status: "completed",
+        inferred: IDLE_CHILD_INFERRED,
         subtitle: "claude-sonnet-5 · Max",
       },
     });
