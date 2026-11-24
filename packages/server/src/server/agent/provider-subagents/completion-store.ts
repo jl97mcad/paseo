@@ -304,12 +304,15 @@ export class ProviderSubagentCompletionStore {
     if (!recovery) {
       const sequence =
         event.status === "running" ? null : (journal.projection[key]?.sequence ?? null);
-      await this.save({
+      const next = {
         ...journal,
-        events: [...journal.events],
         projectionRevision: revision,
         projection: { ...journal.projection, [key]: { sequence, revision } },
-      });
+      };
+      // The revision is only read in-process, so a marker that already names this sequence
+      // advances in memory. Only a changed marker is durable, which bounds writes per helper.
+      if (journal.projection[key]?.sequence === sequence) this.journal = next;
+      else await this.save({ ...next, events: [...journal.events] });
     }
     return true;
   }
