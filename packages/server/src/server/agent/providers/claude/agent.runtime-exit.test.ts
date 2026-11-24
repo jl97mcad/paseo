@@ -282,7 +282,12 @@ describe("Claude runtime exit", () => {
       expect(events).toContainEqual({
         type: "provider_subagent",
         provider: "claude",
-        event: { type: "upsert", id: "toolu_workflow", status: "failed" },
+        event: {
+          type: "upsert",
+          id: "toolu_workflow",
+          status: "failed",
+          inferred: { reason: "Claude process lost while the task was running" },
+        },
       });
     } finally {
       await session.close();
