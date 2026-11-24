@@ -42,6 +42,7 @@ const journalSchema = z.object({
   coverageUncertain: z.boolean().default(false),
   recoveryIdentities: z.array(z.string()).default([]),
   recoveryIdentitiesDiscarded: z.number().int().nonnegative().default(0),
+  recoveryCursor: z.string().nullable().default(null),
 });
 type Journal = z.infer<typeof journalSchema>;
 
@@ -126,6 +127,7 @@ export class ProviderSubagentCompletionStore {
         coverageUncertain: false,
         recoveryIdentities: [],
         recoveryIdentitiesDiscarded: 0,
+        recoveryCursor: null,
       };
     }
     return this.journal;
@@ -172,7 +174,6 @@ export class ProviderSubagentCompletionStore {
     event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
     provenance = "provider-stream",
     gaps: string[] = [],
-    recovered = false,
   ): Promise<ProviderSubagentCompletion | null> {
     if (event.status === "running") return Promise.resolve(null);
     return this.serialize(async () => {
@@ -195,11 +196,11 @@ export class ProviderSubagentCompletionStore {
         provenance,
         identity ?? deliveryId,
       ]);
-      const progress = recoveryProgress(journal, eventKey, recovered && identity !== null);
-      if (!progress) return null;
+      const progress = recoveryProgress(journal, eventKey, identity !== null);
       const existing = identity && journal.events.find((entry) => entry.eventKey === eventKey);
+      if (!progress) return existing || null;
       if (existing) {
-        if (recovered) await this.save({ ...journal, events: [...journal.events], ...progress });
+        if (identity) await this.save({ ...journal, events: [...journal.events], ...progress });
         return existing;
       }
       const completion = completionSchema.parse({
@@ -488,6 +489,17 @@ export class ProviderSubagentCompletionStore {
         events: [...journal.events, entry],
       });
       return entry;
+    });
+  }
+
+  recoveryCursor(): Promise<string | null> {
+    return this.serialize(async () => (await this.load()).recoveryCursor);
+  }
+
+  advanceRecoveryCursor(id: string): Promise<void> {
+    return this.serialize(async () => {
+      const journal = await this.load();
+      await this.save({ ...journal, events: [...journal.events], recoveryCursor: id });
     });
   }
 

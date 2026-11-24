@@ -23,8 +23,19 @@ export async function recoverCodexHistory(
     logger.warn({ skipped: candidates.length }, "Codex helper history recovery unavailable");
     return;
   }
+  // ponytail: 25 parents per startup; revisit in sorted rotation on later starts.
+  candidates.sort((a, b) => {
+    if (a.id < b.id) return -1;
+    if (a.id > b.id) return 1;
+    return 0;
+  });
+  const cursor = await store.recoveryCursor();
+  const start = cursor ? candidates.findIndex((record) => record.id > cursor) : 0;
+  const ordered =
+    start < 0 ? candidates : [...candidates.slice(start), ...candidates.slice(0, start)];
+  const batch = ordered.slice(0, 25);
   let remaining = candidates.length;
-  for (const record of candidates) {
+  for (const record of batch) {
     if (signal.aborted) break;
     const handle = record.persistence;
     if (!handle) continue;
@@ -45,6 +56,8 @@ export async function recoverCodexHistory(
     } catch (err) {
       logger.warn({ err, agentId: record.id }, "Codex helper history recovery incomplete");
     }
+    if (signal.aborted) break;
+    await store.advanceRecoveryCursor(record.id);
     remaining--;
   }
   if (remaining) logger.warn({ skipped: remaining }, "Codex helper history recovery stopped early");
@@ -66,6 +79,6 @@ async function appendHistory(
       event.event.status === "running"
     )
       continue;
-    await store.append(parentId, event.provider, event.event, "provider-stream", [], true);
+    await store.append(parentId, event.provider, event.event, "provider-stream");
   }
 }

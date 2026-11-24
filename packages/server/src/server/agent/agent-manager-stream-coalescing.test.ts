@@ -2732,6 +2732,26 @@ test("startup recovery journals source turns for unloaded agents without duplica
     await recoverCodexHistory([record], client, restarted, createTestLogger(), signal);
     expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[0])).toHaveLength(2);
     expect((await restarted.consume(AGENT_IDS[0], "recovery")).coverageUncertain).toBe(true);
+    const liveRoot = join(root, "live-compact");
+    const liveStore = new ProviderSubagentCompletionStore(liveRoot, 1);
+    await liveStore.append(AGENT_IDS[0], "codex", {
+      type: "upsert",
+      id: "child",
+      status: "completed",
+      nativeTurnId: "turn-one",
+    });
+    await liveStore.append(AGENT_IDS[0], "codex", {
+      type: "upsert",
+      id: "other",
+      status: "completed",
+      nativeTurnId: "other-turn",
+    });
+    const liveRestarted = new ProviderSubagentCompletionStore(liveRoot, 1);
+    await recoverCodexHistory([record], client, liveRestarted, createTestLogger(), signal);
+    expect(await liveRestarted.readAll(AGENT_IDS[0])).toMatchObject([
+      { sequence: 3, nativeTurnId: "turn-two" },
+    ]);
+
     const compactRoot = join(root, "compact");
     await recoverCodexHistory(
       [record],
@@ -2756,6 +2776,64 @@ test("startup recovery journals source turns for unloaded agents without duplica
   } finally {
     for (const server of servers) server.disconnect();
   }
+});
+
+test("recovery scans a bounded rotating batch across journal restarts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-scan-"));
+  const client = new TestAgentClient();
+  const seen: string[] = [];
+  vi.spyOn(client, "resumeSession").mockImplementation(async (_handle, _config, context) => {
+    seen.push(context.agentId);
+    throw new Error("synthetic unavailable history");
+  });
+  const records = Array.from({ length: 27 }, (_, index) =>
+    parseStoredAgentRecord({
+      id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      provider: "codex",
+      cwd: root,
+      createdAt: "2026-01-02T00:00:00.000Z",
+      updatedAt: "2026-01-02T00:00:00.000Z",
+      persistence: { provider: "codex", sessionId: `thread-${index}` },
+    }),
+  );
+  const signal = new AbortController().signal;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    createTestLogger(),
+    signal,
+  );
+  expect(seen).toEqual(records.slice(0, 25).map((record) => record.id));
+  seen.length = 0;
+  await recoverCodexHistory(
+    records,
+    client,
+    new ProviderSubagentCompletionStore(root),
+    createTestLogger(),
+    signal,
+  );
+  expect(seen.slice(0, 2)).toEqual(records.slice(25).map((record) => record.id));
+  expect(seen).toHaveLength(25);
+});
+
+test("identity eviction reports the deduplication limit after restart", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-identities-"));
+  await writeJsonFileAtomic(join(root, "provider-subagent-completions.json"), {
+    events: [],
+    recoveryIdentities: Array.from({ length: 10000 }, (_, i) => `old-${i}`),
+  });
+  const store = new ProviderSubagentCompletionStore(root);
+  await store.append("parent", "codex", {
+    type: "upsert",
+    id: "child",
+    status: "completed",
+    nativeTurnId: "turn",
+  });
+  expect(
+    (await new ProviderSubagentCompletionStore(root).consume("parent", "reader"))
+      .recoveryIdentitiesDiscarded,
+  ).toBe(1);
 });
 
 test("external consumer capacity cannot block lifecycle recovery", async () => {
