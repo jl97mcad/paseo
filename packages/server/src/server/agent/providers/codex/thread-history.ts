@@ -23,6 +23,11 @@ export interface CodexHistoryRow {
 interface CodexThreadHistoryRead {
   rows: Iterable<CodexHistoryRow> | AsyncIterable<CodexHistoryRow>;
   status: CodexHistoryStatus | null;
+  terminalTurns: {
+    id: string;
+    status: Exclude<CodexHistoryStatus, "running">;
+    completedAt: unknown;
+  }[];
 }
 
 /** A history reply over the line cap; the rows before it were already read. */
@@ -141,6 +146,7 @@ export async function readCodexThreadHistory(
     const active = readHistoryStatus(metadata.status);
     return {
       rows: readPaginatedHistory(client, threadId),
+      terminalTurns: [],
       status:
         active ?? (options?.readLatestTurn ? await readLatestTurnStatus(client, threadId) : null),
     };
@@ -157,6 +163,12 @@ export async function readCodexThreadHistory(
   const { thread } = CodexLegacyThreadReadSchema.parse(response);
   return {
     rows: readLegacyRows(thread.turns),
+    terminalTurns: thread.turns.flatMap((turn) => {
+      const status = readHistoryStatus(undefined, turn.status);
+      return turn.id && status && status !== "running"
+        ? [{ id: turn.id, status, completedAt: turn.completedAt }]
+        : [];
+    }),
     status: readHistoryStatus(thread.status, thread.turns.at(-1)?.status),
   };
 }

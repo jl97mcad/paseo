@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
@@ -40,8 +40,36 @@ const journalSchema = z.object({
   discardedThrough: z.number().int().nonnegative().default(0),
   events: z.array(completionSchema),
   coverageUncertain: z.boolean().default(false),
+  recoveryIdentities: z.array(z.string()).default([]),
+  recoveryIdentitiesDiscarded: z.number().int().nonnegative().default(0),
 });
 type Journal = z.infer<typeof journalSchema>;
+
+function sourceIdentity(
+  event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+  outcome: string,
+): string[] | null {
+  if (event.sourceEventId) return ["event", event.sourceEventId];
+  if (event.nativeTurnId) return ["turn", event.nativeTurnId, outcome];
+  return null;
+}
+
+function recoveryProgress(journal: Journal, eventKey: string, recovered: boolean) {
+  if (!recovered)
+    return {
+      recoveryIdentities: journal.recoveryIdentities,
+      recoveryIdentitiesDiscarded: journal.recoveryIdentitiesDiscarded,
+    };
+  const key = createHash("sha256").update(eventKey).digest("hex");
+  if (journal.recoveryIdentities.includes(key)) return null;
+  return {
+    recoveryIdentities: [...journal.recoveryIdentities, key].slice(-10_000),
+    recoveryIdentitiesDiscarded: Math.min(
+      Number.MAX_SAFE_INTEGER,
+      journal.recoveryIdentitiesDiscarded + (journal.recoveryIdentities.length >= 10_000 ? 1 : 0),
+    ),
+  };
+}
 
 // Host scope is a distinct type, not an empty parent ID: parent IDs must be non-empty, so only the
 // *Host methods can reach a host registration. The serialized key keeps the empty-parent shape.
@@ -96,6 +124,8 @@ export class ProviderSubagentCompletionStore {
         discardedThrough: 0,
         events: [],
         coverageUncertain: false,
+        recoveryIdentities: [],
+        recoveryIdentitiesDiscarded: 0,
       };
     }
     return this.journal;
@@ -142,14 +172,13 @@ export class ProviderSubagentCompletionStore {
     event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
     provenance = "provider-stream",
     gaps: string[] = [],
+    recovered = false,
   ): Promise<ProviderSubagentCompletion | null> {
     if (event.status === "running") return Promise.resolve(null);
     return this.serialize(async () => {
       const journal = await this.load();
       const outcome = event.status ?? "unknown";
-      let identity: string[] | null = null;
-      if (event.sourceEventId) identity = ["event", event.sourceEventId];
-      else if (event.nativeTurnId) identity = ["turn", event.nativeTurnId, outcome];
+      const identity = sourceIdentity(event, outcome);
       const missing = Object.entries({
         "native event identity unavailable": event.sourceEventId,
         "native turn identity unavailable": event.nativeTurnId,
@@ -166,8 +195,13 @@ export class ProviderSubagentCompletionStore {
         provenance,
         identity ?? deliveryId,
       ]);
+      const progress = recoveryProgress(journal, eventKey, recovered && identity !== null);
+      if (!progress) return null;
       const existing = identity && journal.events.find((entry) => entry.eventKey === eventKey);
-      if (existing) return existing;
+      if (existing) {
+        if (recovered) await this.save({ ...journal, events: [...journal.events], ...progress });
+        return existing;
+      }
       const completion = completionSchema.parse({
         sequence: journal.nextSequence ?? (journal.events.at(-1)?.sequence ?? 0) + 1,
         deliveryId,
@@ -196,6 +230,7 @@ export class ProviderSubagentCompletionStore {
       await this.save({
         ...journal,
         nextSequence: completion.sequence + 1,
+        ...progress,
         events: [...journal.events, completion],
       });
       this.failedAppends.delete(parentAgentId);
@@ -303,6 +338,7 @@ export class ProviderSubagentCompletionStore {
         journal = await this.load();
       }
       return {
+        recoveryIdentitiesDiscarded: journal.recoveryIdentitiesDiscarded,
         coverageUncertain:
           journal.coverageUncertain ||
           this.failedAppends.size > 0 ||
@@ -452,6 +488,15 @@ export class ProviderSubagentCompletionStore {
         events: [...journal.events, entry],
       });
       return entry;
+    });
+  }
+
+  markCoverageUncertain(): Promise<void> {
+    return this.serialize(async () => {
+      const journal = await this.load();
+      if (!journal.coverageUncertain) {
+        await this.save({ ...journal, coverageUncertain: true, events: [...journal.events] });
+      }
     });
   }
 

@@ -12,7 +12,8 @@ import { ProviderSnapshotManager } from "./provider-snapshot-manager.js";
 import { writeJsonFileAtomic } from "../atomic-file.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager, type AgentManagerEvent } from "./agent-manager.js";
-import { AgentStorage } from "./agent-storage.js";
+import { AgentStorage, parseStoredAgentRecord } from "./agent-storage.js";
+import { recoverCodexHistory } from "./provider-subagents/recover-codex-history.js";
 import { ProviderSubagentCompletionStore } from "./provider-subagents/completion-store.js";
 import { ensureAgentLoaded } from "./agent-loading.js";
 import { AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS } from "./agent-stream-coalescer.js";
@@ -2554,6 +2555,206 @@ test("Codex preserves native terminal identity separately from normalized routin
   } finally {
     await session.close();
     appServer.disconnect();
+  }
+});
+
+test("Codex history retains each source terminal with its native turn and time", async () => {
+  const appServer = createFakeCodexAppServer({
+    "thread/read": (params) => {
+      const { threadId } = params as { threadId: string };
+      if (threadId === "thread-1")
+        return {
+          thread: {
+            turns: [
+              {
+                items: [
+                  {
+                    type: "collabAgentToolCall",
+                    id: "spawn",
+                    tool: "spawnAgent",
+                    status: "inProgress",
+                    prompt: "child",
+                    receiverThreadIds: ["child"],
+                    agentsStates: { child: { status: "running" } },
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      return {
+        thread: {
+          turns: [
+            {
+              id: "child-turn-1",
+              status: "completed",
+              completedAt: 1767323045,
+              items: [{ type: "agentMessage", id: "message-1", text: "first" }],
+            },
+            {
+              id: "child-turn-2",
+              status: "failed",
+              completedAt: 1767323105,
+              items: [{ type: "agentMessage", id: "message-2", text: "second" }],
+            },
+          ],
+        },
+      };
+    },
+  });
+  const session = new CodexAppServerAgentSession(
+    { provider: "codex", cwd: process.cwd(), model: "gpt-5.4" },
+    { sessionId: "thread-1" },
+    createTestLogger(),
+    async () => appServer.child,
+  );
+  try {
+    await session.getRuntimeInfo();
+    const observations: unknown[] = [];
+    for await (const event of session.streamHistory()) {
+      if (event.type === "provider_subagent" && event.event.type === "upsert")
+        observations.push(event.event);
+    }
+    expect(observations).toMatchObject([
+      {
+        id: "child",
+        status: "completed",
+        nativeTurnId: "child-turn-1",
+        timestamp: "2026-01-02T03:04:05.000Z",
+      },
+      {
+        id: "child",
+        status: "failed",
+        nativeTurnId: "child-turn-2",
+        timestamp: "2026-01-02T03:05:05.000Z",
+      },
+    ]);
+    appServer.assertNoErrors();
+  } finally {
+    await session.close();
+    appServer.disconnect();
+  }
+});
+
+test("startup recovery journals source turns for unloaded agents without duplicate replay", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-recovery-"));
+  const client = new TestAgentClient();
+  let paginated = false;
+  const servers: ReturnType<typeof createFakeCodexAppServer>[] = [];
+  vi.spyOn(client, "resumeSession").mockImplementation(async () => {
+    const server = createFakeCodexAppServer({
+      "thread/read": (params) => {
+        const { threadId } = params as { threadId: string };
+        if (threadId !== "parent-thread") {
+          if (paginated) return { thread: { historyMode: "paginated" } };
+          return {
+            thread: {
+              turns: [
+                { id: "turn-one", status: "completed", completedAt: 1767323045, items: [] },
+                { id: "turn-two", status: "failed", completedAt: 1767323105, items: [] },
+              ],
+            },
+          };
+        }
+        return {
+          thread: {
+            turns: [
+              {
+                items: [
+                  {
+                    type: "collabAgentToolCall",
+                    id: "spawn",
+                    tool: "spawnAgent",
+                    status: "inProgress",
+                    prompt: "child",
+                    receiverThreadIds: ["child"],
+                    agentsStates: { child: { status: "running" } },
+                  },
+                ],
+              },
+            ],
+          },
+        };
+      },
+      "thread/items/list": () => ({
+        data: [
+          {
+            turnId: "unbound",
+            item: { type: "agentMessage", id: "message", text: "output" },
+            completedAtMs: 1767323045000,
+          },
+        ],
+      }),
+      "thread/turns/list": () => ({ data: [{ id: "unbound", status: "failed" }] }),
+    });
+    servers.push(server);
+    const session = new CodexAppServerAgentSession(
+      { provider: "codex", cwd: root },
+      { sessionId: "parent-thread" },
+      createTestLogger(),
+      async () => server.child,
+    );
+    await session.getRuntimeInfo();
+    return session;
+  });
+  const record = parseStoredAgentRecord({
+    id: AGENT_IDS[0],
+    provider: "codex",
+    cwd: root,
+    createdAt: "2026-01-02T00:00:00.000Z",
+    updatedAt: "2026-01-02T00:00:00.000Z",
+    persistence: { provider: "codex", sessionId: "parent-thread" },
+  });
+  try {
+    const signal = new AbortController().signal;
+    await recoverCodexHistory(
+      [record],
+      client,
+      new ProviderSubagentCompletionStore(root),
+      createTestLogger(),
+      signal,
+    );
+    const restarted = new ProviderSubagentCompletionStore(root);
+    expect(await restarted.readAll(AGENT_IDS[0])).toMatchObject([
+      {
+        helperId: "child",
+        nativeTurnId: "turn-one",
+        outcome: "completed",
+        sourceEventTime: "2026-01-02T03:04:05.000Z",
+      },
+      {
+        helperId: "child",
+        nativeTurnId: "turn-two",
+        outcome: "failed",
+        sourceEventTime: "2026-01-02T03:05:05.000Z",
+      },
+    ]);
+    await recoverCodexHistory([record], client, restarted, createTestLogger(), signal);
+    expect(await new ProviderSubagentCompletionStore(root).readAll(AGENT_IDS[0])).toHaveLength(2);
+    expect((await restarted.consume(AGENT_IDS[0], "recovery")).coverageUncertain).toBe(true);
+    const compactRoot = join(root, "compact");
+    await recoverCodexHistory(
+      [record],
+      client,
+      new ProviderSubagentCompletionStore(compactRoot, 1),
+      createTestLogger(),
+      signal,
+    );
+    const compactRestarted = new ProviderSubagentCompletionStore(compactRoot, 1);
+    await recoverCodexHistory([record], client, compactRestarted, createTestLogger(), signal);
+    expect(await compactRestarted.readAll(AGENT_IDS[0])).toMatchObject([
+      { sequence: 2, nativeTurnId: "turn-two" },
+    ]);
+
+    paginated = true;
+    const unbound = new ProviderSubagentCompletionStore(join(root, "paginated"));
+    await recoverCodexHistory([record], client, unbound, createTestLogger(), signal);
+    expect(await unbound.readAll(AGENT_IDS[0])).toEqual([]);
+    expect((await unbound.consume(AGENT_IDS[0], "recovery")).coverageUncertain).toBe(true);
+
+    for (const server of servers) server.assertNoErrors();
+  } finally {
+    for (const server of servers) server.disconnect();
   }
 });
 

@@ -716,6 +716,8 @@ export type AgentResumePurpose = "interactive" | "history";
 
 /** Runtime-only intent for a persisted-session resume. Never persist this option. */
 export interface AgentResumeSessionOptions {
+  /** Cancel a read-only history session while it is opening. */
+  signal?: AbortSignal;
   /** Defaults to interactive. History loading may be read-only for archived native sessions. */
   purpose?: AgentResumePurpose;
   /** See AgentCreateSessionOptions.configuredModelIds. */

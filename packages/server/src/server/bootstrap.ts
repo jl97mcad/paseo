@@ -4,6 +4,7 @@ import { sendPromptToAgent, unarchiveAgentState } from "./agent/agent-prompt.js"
 import { createChangeRequestWatches } from "./agent/change-request-watches/index.js";
 import { createIdleRuntimeCleanup } from "./agent/idle-runtime-cleanup/index.js";
 import { ProviderSubagentCompletionStore } from "./agent/provider-subagents/completion-store.js";
+import { recoverCodexHistory } from "./agent/provider-subagents/recover-codex-history.js";
 import {
   createFinishSubscriptions,
   createFinishObservation,
@@ -1039,13 +1040,16 @@ export async function createPaseoDaemon(
     if (git) configureGitProcessPolicy(git);
   });
   const initialAgentManagerState = providerSnapshotManager.getAgentManagerProviderState();
+  const completionStore = new ProviderSubagentCompletionStore(config.paseoHome);
+  const helperRecoveryAbort = new AbortController();
+  let helperRecovery: Promise<void> | undefined;
   const agentManager = new AgentManager({
     pluginLifecycle: pluginRuntime,
     pluginAgentTools: pluginRuntime,
     clients: initialAgentManagerState.clients,
     providerDefinitions: initialAgentManagerState.providerDefinitions,
     registry: agentStorage,
-    providerSubagentCompletionStore: new ProviderSubagentCompletionStore(config.paseoHome),
+    providerSubagentCompletionStore: completionStore,
     appendSystemPrompt: config.appendSystemPrompt,
     onWorkspaceStateMayHaveChanged: ({ cwd }) => {
       workspaceGitService.onWorkspaceStateMayHaveChanged(cwd);
@@ -1969,6 +1973,13 @@ export async function createPaseoDaemon(
             pluginRuntime.bindPaseoSessionHost(wsServer);
             await pluginRuntime.start();
             providerSnapshotManager.settlePluginProviders();
+            helperRecovery = recoverCodexHistory(
+              persistedRecords,
+              providerSnapshotManager.getAgentManagerProviderState().clients.codex,
+              completionStore,
+              logger,
+              helperRecoveryAbort.signal,
+            ).catch((err) => logger.warn({ err }, "Codex helper history recovery failed"));
             restartRecovery.resumePending();
             await finishSubscriptions.start();
             await changeRequestWatches.start();
@@ -2033,6 +2044,14 @@ export async function createPaseoDaemon(
       await deleteLocalCredential(config.paseoHome);
       unsubscribePluginProviders();
       unsubscribePluginSessionChanges();
+      helperRecoveryAbort.abort();
+      if (helperRecovery) {
+        await withTimeout({
+          promise: helperRecovery,
+          timeoutMs: AGENT_CLOSE_TIMEOUT_MS,
+          label: "stop helper history recovery",
+        }).catch((err) => logger.warn({ err }, "Helper history recovery did not stop"));
+      }
       await pluginRuntime.stopAllPlugins().catch(() => undefined);
       await serviceProxy.stopStandalone().catch(() => undefined);
       await agentProviderRuntime.shutdown().catch(() => undefined);
@@ -2055,6 +2074,14 @@ export async function createPaseoDaemon(
     // they serve has been closed, further down.
     unsubscribePluginProviders();
     unsubscribePluginSessionChanges();
+    helperRecoveryAbort.abort();
+    if (helperRecovery) {
+      await withTimeout({
+        promise: helperRecovery,
+        timeoutMs: AGENT_CLOSE_TIMEOUT_MS,
+        label: "stop helper history recovery",
+      }).catch((err) => logger.warn({ err }, "Helper history recovery did not stop"));
+    }
     await hubRelationships.stop();
     workspaceReconciliation.dispose();
     scriptHealthMonitor.stop();
