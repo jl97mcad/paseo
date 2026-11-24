@@ -7,6 +7,9 @@ import { writeJsonFileAtomic } from "../../atomic-file.js";
 import type { AgentProvider } from "../agent-sdk-types.js";
 import type { ProviderSubagentInputEvent } from "./store.js";
 
+/** Provenance of a terminal the adapter derived, so consumers can tell it from a native one. */
+export const ADAPTER_INFERRED_PROVENANCE = "adapter-inferred";
+
 const completionSchema = z.object({
   sequence: z.number().int().positive(),
   deliveryId: z.string().default(() => randomUUID()),
@@ -53,6 +56,56 @@ function sourceIdentity(
   if (event.sourceEventId) return ["event", event.sourceEventId];
   if (event.nativeTurnId) return ["turn", event.nativeTurnId, outcome];
   return null;
+}
+
+function missingEvidence(
+  event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+  sourceEventTime: string | undefined,
+): string[] {
+  return Object.entries({
+    "native event identity unavailable": event.sourceEventId,
+    "native turn identity unavailable": event.nativeTurnId,
+    "helper role unavailable": event.role,
+    "source event time unavailable": sourceEventTime,
+  })
+    .filter(([, value]) => !value)
+    .map(([gap]) => gap);
+}
+
+/** A re-read of state adds nothing once the helper has any completion on record. */
+function isRepeatedSnapshot(
+  journal: Journal,
+  parentAgentId: string,
+  provider: AgentProvider,
+  event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+): boolean {
+  return (
+    event.inferred?.snapshot === true &&
+    journal.events.some(
+      (entry) =>
+        entry.parentAgentId === parentAgentId &&
+        entry.provider === provider &&
+        entry.helperId === event.id &&
+        entry.kind === "completion",
+    )
+  );
+}
+
+/**
+ * An adapter-derived outcome has no source event, so the adapter's own timestamp is not recorded
+ * as one.
+ */
+function describeSource(
+  event: Extract<ProviderSubagentInputEvent, { type: "upsert" }>,
+  provenance: string,
+) {
+  if (!event.inferred)
+    return { sourceEventTime: event.timestamp, recordedProvenance: provenance, inferredGaps: [] };
+  return {
+    sourceEventTime: undefined,
+    recordedProvenance: ADAPTER_INFERRED_PROVENANCE,
+    inferredGaps: [`outcome inferred by adapter: ${event.inferred.reason}`],
+  };
 }
 
 function recoveryProgress(journal: Journal, eventKey: string, hasIdentity: boolean) {
@@ -180,20 +233,18 @@ export class ProviderSubagentCompletionStore {
       const journal = await this.load();
       const outcome = event.status ?? "unknown";
       const identity = sourceIdentity(event, outcome);
-      const missing = Object.entries({
-        "native event identity unavailable": event.sourceEventId,
-        "native turn identity unavailable": event.nativeTurnId,
-        "helper role unavailable": event.role,
-        "source event time unavailable": event.timestamp,
-      })
-        .filter(([, value]) => !value)
-        .map(([gap]) => gap);
+      if (isRepeatedSnapshot(journal, parentAgentId, provider, event)) return null;
+      const { sourceEventTime, recordedProvenance, inferredGaps } = describeSource(
+        event,
+        provenance,
+      );
+      const missing = missingEvidence(event, sourceEventTime);
       const deliveryId = randomUUID();
       const eventKey = JSON.stringify([
         parentAgentId,
         provider,
         event.id,
-        provenance,
+        recordedProvenance,
         identity ?? deliveryId,
       ]);
       const progress = recoveryProgress(journal, eventKey, identity !== null);
@@ -215,14 +266,15 @@ export class ProviderSubagentCompletionStore {
         nativeTurnId: event.nativeTurnId ?? null,
         nativeParentId: event.parentSubagentId ?? null,
         role: event.role ?? null,
-        sourceEventTime: event.timestamp ?? null,
-        provenance,
+        sourceEventTime: sourceEventTime ?? null,
+        provenance: recordedProvenance,
         outcome,
         gaps: [
           ...this.failedObservationGaps(parentAgentId),
           ...missing,
           ...(!identity ? ["deduplication identity unavailable"] : []),
           ...(outcome === "unknown" ? ["terminal outcome unavailable"] : []),
+          ...inferredGaps,
           ...gaps,
         ],
       });

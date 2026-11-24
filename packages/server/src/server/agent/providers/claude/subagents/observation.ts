@@ -28,7 +28,14 @@ export type SubagentObservation =
       parentSubagentId?: string;
       timestamp?: string;
     }
-  | { kind: "status"; id: string; status: ProviderSubagentStatus; timestamp?: string }
+  | {
+      kind: "status";
+      id: string;
+      status: ProviderSubagentStatus;
+      timestamp?: string;
+      /** Why this terminal is the adapter's own conclusion, when no terminal was announced. */
+      inferred?: string;
+    }
   /** Complete provider-owned secondary label. Clients display this without parsing it. */
   | { kind: "subtitle"; id: string; subtitle: string; timestamp?: string }
   | { kind: "timeline"; id: string; item: AgentTimelineItem; timestamp?: string };
@@ -73,6 +80,7 @@ export function foldSubagentObservations(
         id: observation.id,
         status: observation.status,
         ...(observation.timestamp ? { timestamp: observation.timestamp } : {}),
+        ...(observation.inferred ? { inferred: { reason: observation.inferred } } : {}),
       });
       continue;
     }

@@ -122,7 +122,10 @@ import {
   type ProviderSubagentDescriptor,
   type ProviderSubagentStoreEvent,
 } from "./provider-subagents/store.js";
-import { ProviderSubagentCompletionStore } from "./provider-subagents/completion-store.js";
+import {
+  ADAPTER_INFERRED_PROVENANCE,
+  ProviderSubagentCompletionStore,
+} from "./provider-subagents/completion-store.js";
 import {
   AgentBackgroundWorkStore,
   isDaemonBackgroundWorkItem,
@@ -5078,7 +5081,7 @@ export class AgentManager {
           this.providerSubagentCompletionStore.recordFailedAppend(
             agent.id,
             event.event.id,
-            "provider-stream",
+            event.event.inferred ? ADAPTER_INFERRED_PROVENANCE : "provider-stream",
           );
           this.logger.error(
             { err, parentAgentId: agent.id, helperId: event.event.id },

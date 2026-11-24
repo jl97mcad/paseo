@@ -75,7 +75,9 @@ export class OmpSubagentIndex {
         continue;
       }
       state.status = "canceled";
-      events.push(this.upsert(id, state.status, state));
+      events.push(
+        this.upsert(id, state.status, state, "helper still running when the turn was interrupted"),
+      );
     }
     return events;
   }
@@ -105,6 +107,7 @@ export class OmpSubagentIndex {
     id: string,
     status: "running" | "completed" | "failed" | "canceled",
     state: OmpSubagentState,
+    inferred?: string,
   ): AgentStreamEvent {
     return {
       type: "provider_subagent",
@@ -116,6 +119,7 @@ export class OmpSubagentIndex {
         description: state.description,
         status,
         toolCallId: state.toolCallId,
+        ...(inferred ? { inferred: { reason: inferred } } : {}),
       },
     };
   }

@@ -37,6 +37,18 @@ export interface ProviderSubagentDescriptor {
   completionEvidence?: ProviderSubagentCompletionEvidence;
 }
 
+/**
+ * Marks a terminal status the adapter derived instead of receiving a terminal event for it, such
+ * as a task canceled because its turn ended or a state read that found a child idle. Internal to
+ * the daemon: the descriptor and the wire never carry it, the journal records it as provenance.
+ * `snapshot` marks a re-read of current state rather than a transition, so repeating the read
+ * adds nothing once the helper has a terminal on record.
+ */
+export interface ProviderSubagentInferredOutcome {
+  reason: string;
+  snapshot?: true;
+}
+
 export type ProviderSubagentInputEvent =
   | {
       type: "upsert";
@@ -56,6 +68,7 @@ export type ProviderSubagentInputEvent =
       sourceEventId?: string;
       nativeTurnId?: string;
       role?: string;
+      inferred?: ProviderSubagentInferredOutcome;
       completionEvidence?: ProviderSubagentCompletionEvidence;
     }
   | {

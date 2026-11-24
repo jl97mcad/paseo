@@ -314,7 +314,12 @@ export class ClaudeTaskProtocolSource {
       if (this.backgroundedIds.has(id)) continue;
       if (this.lastStatusById.get(id) !== "running") continue;
       this.lastStatusById.set(id, "canceled");
-      observations.push({ kind: "status", id, status: "canceled" });
+      observations.push({
+        kind: "status",
+        id,
+        status: "canceled",
+        inferred: "foreground task still running when the turn was canceled",
+      });
     }
     return observations;
   }
@@ -325,7 +330,12 @@ export class ClaudeTaskProtocolSource {
     for (const id of this.declaredIds) {
       if (this.lastStatusById.get(id) !== "running") continue;
       this.lastStatusById.set(id, "failed");
-      observations.push({ kind: "status", id, status: "failed" });
+      observations.push({
+        kind: "status",
+        id,
+        status: "failed",
+        inferred: "Claude process lost while the task was running",
+      });
     }
     return observations;
   }

@@ -24,6 +24,12 @@ import {
   createFakeCodexAppServer,
   waitForNextEvent,
 } from "./providers/codex/test-utils/fake-app-server.js";
+import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { ClaudeTaskProtocolSource } from "./providers/claude/subagents/live-source.js";
+import {
+  foldSubagentObservations,
+  type SubagentObservation,
+} from "./providers/claude/subagents/observation.js";
 import { OmpAgentClient } from "./providers/omp/agent.js";
 import { FakeOmp } from "./providers/omp/test-utils/fake-omp.js";
 import { PiRpcAgentClient } from "./providers/pi/agent.js";
@@ -3126,4 +3132,186 @@ test("an empty parent ID cannot reach host replay through the parent API", async
   await expect(store.acceptGap("", "consumer", 0)).rejects.toThrow();
   await expect(store.releaseConsumer("", "consumer")).rejects.toThrow();
   await expect(store.replay("", "consumer")).rejects.toThrow();
+});
+
+describe("adapter-inferred helper terminals", () => {
+  async function setup(provider: "codex" | "omp", clients: Partial<Record<string, AgentClient>>) {
+    const root = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "completion-inferred-"));
+    const logger = createTestLogger();
+    const completions = new ProviderSubagentCompletionStore(root);
+    const manager = new AgentManager({
+      clients,
+      registry: new AgentStorage(join(root, "agents"), logger),
+      providerSubagentCompletionStore: completions,
+      logger,
+    });
+    await manager.createAgent({ provider, cwd: root }, AGENT_IDS[0], { workspaceId: undefined });
+    return { root, completions, manager };
+  }
+
+  test("journals Claude's synthesized cancel and failure apart from a native settle", async () => {
+    const client = new TestAgentClient();
+    const { root, completions, manager } = await setup("codex", { codex: client });
+    const source = new ClaudeTaskProtocolSource();
+    const started = (id: string, task: string) =>
+      ({
+        type: "system",
+        subtype: "task_started",
+        task_id: task,
+        tool_use_id: id,
+        description: id,
+        subagent_type: "general-purpose",
+        task_type: "local_agent",
+      }) as unknown as SDKMessage;
+    const session = client.getSession(root);
+    const push = (observations: SubagentObservation[]) => {
+      for (const event of foldSubagentObservations(observations))
+        session.pushEvent({ type: "provider_subagent", provider: "claude", event });
+    };
+    push(source.observe(started("toolu_native", "task-native")));
+    push(
+      source.observe({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-native",
+        tool_use_id: "toolu_native",
+        status: "completed",
+      } as unknown as SDKMessage),
+    );
+    push(source.observe(started("toolu_canceled", "task-canceled")));
+    push(source.cancelRunningForegroundTasks());
+    push(source.observe(started("toolu_failed", "task-failed")));
+    push(source.failRunningTasks());
+    await waitForSessionEventQueue();
+    await manager.flush();
+
+    const journal = await completions.readAll(AGENT_IDS[0]);
+    expect(
+      journal.map(({ helperId, outcome, provenance, sourceEventTime }) => ({
+        helperId,
+        outcome,
+        provenance,
+        sourceEventTime,
+      })),
+    ).toEqual([
+      {
+        helperId: "toolu_native",
+        outcome: "completed",
+        provenance: "provider-stream",
+        sourceEventTime: null,
+      },
+      {
+        helperId: "toolu_canceled",
+        outcome: "canceled",
+        provenance: "adapter-inferred",
+        sourceEventTime: null,
+      },
+      {
+        helperId: "toolu_failed",
+        outcome: "failed",
+        provenance: "adapter-inferred",
+        sourceEventTime: null,
+      },
+    ]);
+    expect(journal[0]?.gaps).not.toContain("outcome inferred by adapter");
+    expect(journal[1]?.gaps).toContain(
+      "outcome inferred by adapter: foreground task still running when the turn was canceled",
+    );
+    expect(journal[2]?.gaps).toContain(
+      "outcome inferred by adapter: Claude process lost while the task was running",
+    );
+    // Projection is unchanged: the descriptors still show the inferred outcome.
+    expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+      { id: "toolu_native", status: "completed" },
+      { id: "toolu_canceled", status: "canceled" },
+      { id: "toolu_failed", status: "failed" },
+    ]);
+  });
+
+  test("journals OMP's interrupt-synthesized cancel apart from a native lifecycle outcome", async () => {
+    const runtime = new FakeOmp();
+    const logger = createTestLogger();
+    const { manager, completions } = await setup("omp", {
+      omp: new OmpAgentClient({
+        runtime,
+        logger,
+        runtimeSettings: { command: { mode: "replace", argv: [process.execPath] } },
+      }),
+    });
+    const session = runtime.latestSession();
+    const run = manager.runAgent(AGENT_IDS[0], "Work").catch(() => undefined);
+    await vi.waitFor(() => expect(session.prompts).toHaveLength(1));
+    session.beginTurn();
+    const lifecycle = (id: string, status: "started" | "completed") =>
+      session.emit({
+        type: "subagent_lifecycle",
+        payload: { id, agent: "worker", status, index: 0 },
+      });
+    lifecycle("native-done", "started");
+    lifecycle("native-done", "completed");
+    lifecycle("still-running", "started");
+    await vi.waitFor(async () => {
+      expect(manager.listProviderSubagents(AGENT_IDS[0])).toHaveLength(2);
+    });
+    await manager.cancelAgentRun(AGENT_IDS[0]);
+    await run;
+    await manager.flush();
+
+    const journal = await completions.readAll(AGENT_IDS[0]);
+    expect(
+      journal.map(({ helperId, outcome, provenance }) => ({ helperId, outcome, provenance })),
+    ).toEqual([
+      { helperId: "native-done", outcome: "completed", provenance: "provider-stream" },
+      { helperId: "still-running", outcome: "canceled", provenance: "adapter-inferred" },
+    ]);
+    expect(journal[1]).toMatchObject({
+      sourceEventTime: null,
+      sourceEventId: null,
+      nativeTurnId: null,
+      gaps: expect.arrayContaining([
+        "outcome inferred by adapter: helper still running when the turn was interrupted",
+      ]),
+    });
+    expect(manager.listProviderSubagents(AGENT_IDS[0])).toMatchObject([
+      { id: "native-done", status: "completed" },
+      { id: "still-running", status: "canceled" },
+    ]);
+  });
+
+  test("a re-read state snapshot journals once per helper, and never after a recorded terminal", async () => {
+    const client = new TestAgentClient();
+    const { root, completions, manager } = await setup("codex", { codex: client });
+    const session = client.getSession(root);
+    const snapshot = (id: string) => ({
+      type: "provider_subagent" as const,
+      provider: "opencode" as const,
+      event: {
+        type: "upsert" as const,
+        id,
+        status: "completed" as const,
+        inferred: { reason: "child not busy when the session was read", snapshot: true as const },
+      },
+    });
+    // Each resume or gap repair re-reads the same child state.
+    for (let read = 0; read < 3; read += 1) session.pushEvent(snapshot("seen-twice"));
+    // A terminal the provider reported live is already on record.
+    session.pushEvent({
+      type: "provider_subagent",
+      provider: "opencode",
+      event: { type: "upsert", id: "native-first", status: "completed" },
+    });
+    session.pushEvent(snapshot("native-first"));
+    await waitForSessionEventQueue();
+    await manager.flush();
+
+    expect(
+      (await completions.readAll(AGENT_IDS[0])).map(({ helperId, provenance }) => ({
+        helperId,
+        provenance,
+      })),
+    ).toEqual([
+      { helperId: "seen-twice", provenance: "adapter-inferred" },
+      { helperId: "native-first", provenance: "provider-stream" },
+    ]);
+  });
 });

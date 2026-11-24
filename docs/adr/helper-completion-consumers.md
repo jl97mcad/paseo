@@ -1,6 +1,6 @@
 # Durable helper observations and consumers
 
-Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md). Registration limit superseded by [Host replay for helper observations](helper-completion-host-replay.md#limits). Replay results and the process-lifetime overflow and later-observation-only failure warning statements are superseded by [Helper completion coverage warning](helper-completion-coverage.md). Source-event reconstruction limits are superseded by [Codex helper completion history recovery](helper-completion-codex-recovery.md).
+Status: accepted. Supersedes [Provider subagent completion journal](helper-completions.md). Registration limit superseded by [Host replay for helper observations](helper-completion-host-replay.md#limits). Replay results and the process-lifetime overflow and later-observation-only failure warning statements are superseded by [Helper completion coverage warning](helper-completion-coverage.md). Source-event reconstruction limits are superseded by [Codex helper completion history recovery](helper-completion-codex-recovery.md). Provenance of adapter-derived outcomes is superseded by [Adapter-inferred helper outcomes](helper-completion-inferred-outcomes.md).
 
 ## Decision
 

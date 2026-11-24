@@ -520,7 +520,12 @@ describe("ClaudeTaskProtocolSource", () => {
     source.observe(taskStarted());
 
     expect(source.cancelRunningForegroundTasks()).toEqual([
-      { kind: "status", id: "toolu_01DgLoPMW9", status: "canceled" },
+      {
+        kind: "status",
+        id: "toolu_01DgLoPMW9",
+        status: "canceled",
+        inferred: "foreground task still running when the turn was canceled",
+      },
     ]);
     // Idempotent: the child is no longer running, so a second cancellation says nothing.
     expect(source.cancelRunningForegroundTasks()).toEqual([]);
@@ -570,7 +575,12 @@ describe("ClaudeTaskProtocolSource", () => {
     source.observe(taskStarted({ is_backgrounded: false }));
 
     expect(source.cancelRunningForegroundTasks()).toEqual([
-      { kind: "status", id: "toolu_01DgLoPMW9", status: "canceled" },
+      {
+        kind: "status",
+        id: "toolu_01DgLoPMW9",
+        status: "canceled",
+        inferred: "foreground task still running when the turn was canceled",
+      },
     ]);
   });
 

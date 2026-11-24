@@ -187,6 +187,10 @@ function waitForOpenCodeStopProbe(delayMs: number, signal: AbortSignal): Promise
   });
 }
 
+// An idle child in a status snapshot says nothing about whether it completed, failed or stopped.
+const OPENCODE_IDLE_CHILD_REASON = "child not busy when the session was read";
+const OPENCODE_RECOVERED_CHILD_REASON = "child outcome read from session state on recovery";
+
 function recoverChildStatus(snapshot: boolean, type: unknown, assistant?: OpenCodeSessionMessage) {
   if (type === "busy" || type === "retry") return "running";
   if (assistant && "error" in assistant.info && assistant.info.error) return "failed";
@@ -2496,6 +2500,9 @@ function appendOpenCodeChildSessionDetected(
       ...(title ? { title } : {}),
       ...(child.title && !presentation.descriptionFromLink ? { description: child.title } : {}),
       ...(status ? { status } : {}),
+      ...(status === "completed"
+        ? { inferred: { reason: OPENCODE_IDLE_CHILD_REASON, snapshot: true as const } }
+        : {}),
       ...(child.directory ? { cwd: child.directory } : {}),
       ...(subtitle ? { subtitle } : {}),
     },
@@ -4264,7 +4271,15 @@ class OpenCodeAgentSession implements AgentSession {
     const statusEvent: AgentStreamEvent = {
       type: "provider_subagent",
       provider: "opencode",
-      event: { type: "upsert", id: child.id, status: recoveredStatus },
+      event: {
+        type: "upsert",
+        id: child.id,
+        status: recoveredStatus,
+        // A running child is a state read, not a terminal; only terminals are journaled.
+        ...(recoveredStatus === "running"
+          ? {}
+          : { inferred: { reason: OPENCODE_RECOVERED_CHILD_REASON, snapshot: true as const } }),
+      },
     };
     this.recordProviderInternalEvent(statusEvent);
     this.notifySubscribers(statusEvent, null);
