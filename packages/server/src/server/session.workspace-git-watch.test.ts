@@ -1651,6 +1651,58 @@ describe("live workspace observation", () => {
     await session.cleanup();
   });
 
+  test("reuses a shared snapshot populated while a quiet workspace read was queued", async () => {
+    const workspaceRuntimeStore = createWorkspaceRuntimeStore();
+    const { session, projects, workspaces, workspaceGitService, emitted } =
+      createSessionForWorkspaceGitWatchTests({ workspaceRuntimeStore });
+    const releaseReads: Array<() => void> = [];
+    workspaceGitService.getSnapshot.mockImplementation(async (cwd: string) => {
+      if (releaseReads.length < 2) {
+        await new Promise<void>((resolve) => releaseReads.push(resolve));
+      }
+      return createWorkspaceRuntimeSnapshot(cwd);
+    });
+    for (const name of ["one", "two", "three"]) {
+      seedGitWorkspace({
+        projects,
+        workspaces,
+        projectId: "proj-1",
+        workspaceId: `ws-${name}`,
+        cwd: `/tmp/quiet-${name}`,
+        name,
+        updatedAt: OLD,
+      });
+    }
+
+    try {
+      await session.handleMessage({
+        type: "fetch_workspaces_request",
+        requestId: "workspace-list",
+        subscribe: { subscriptionId: "workspace-list" },
+      });
+      await vi.waitFor(() => expect(releaseReads).toHaveLength(2));
+      workspaceRuntimeStore.set(
+        createWorkspaceRuntimeSnapshot("/tmp/quiet-three", { git: { currentBranch: "shared" } }),
+      );
+      releaseReads.forEach((release) => release());
+
+      await vi.waitFor(() =>
+        expect(getWorkspaceUpdates(emitted)).toContainEqual(
+          expect.objectContaining({
+            payload: expect.objectContaining({
+              kind: "upsert",
+              workspace: expect.objectContaining({ id: "ws-three" }),
+            }),
+          }),
+        ),
+      );
+      expect(workspaceGitService.getSnapshot).toHaveBeenCalledTimes(2);
+    } finally {
+      releaseReads.forEach((release) => release());
+      await session.cleanup();
+    }
+  });
+
   test("drops the warm-up reads still queued when the session is cleaned up", async () => {
     const { session, projects, workspaces, workspaceGitService } =
       createSessionForWorkspaceGitWatchTests();
