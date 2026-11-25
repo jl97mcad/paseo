@@ -7727,7 +7727,10 @@ export class Session {
     this.workspaceGitWarmUpCwds.add(cwd);
     return this.workspaceGitWarmUpLimit(async () => {
       try {
-        await this.workspaceGitService.getSnapshot(cwd);
+        // Another session can populate the shared snapshot while this read is queued.
+        if (!this.workspaceRuntimeStore.get(cwd)) {
+          await this.workspaceGitService.getSnapshot(cwd);
+        }
         if (this.isCleanedUp) return;
         await this.emitWorkspaceUpdatesForWorkspaceIds(workspaceIds);
       } catch (error) {
