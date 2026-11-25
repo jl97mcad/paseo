@@ -390,6 +390,8 @@ function beginAgentDeleteIfSupported(agentStorage: AgentStorage, agentId: string
   }
 }
 
+// Pages of one archived-inclusive agent read share a sorted snapshot this long (JON-5372).
+const AGENTS_PAGE_SNAPSHOT_TTL_MS = 30_000;
 const FETCH_AGENTS_SORT_KEYS = ["status_priority", "created_at", "updated_at", "title"] as const;
 
 /** Simultaneous one-shot git reads for workspaces no watcher covers. */
@@ -6233,12 +6235,31 @@ export class Session {
     const scope = request.type === "fetch_agents_request" ? request.scope : undefined;
     const sort = this.agentsPager.normalizeSort(request.sort);
 
-    let agents = await this.listAgentPayloads({
-      labels: filter?.labels,
-      includeArchived: filter?.includeArchived,
-      includeBackground: backgroundVisibility,
-      includeUnavailablePersisted: request.type === "fetch_agent_history_request",
-    });
+    // An archived-inclusive read pages through every stored agent, and each page used to rebuild and
+    // re-sort the whole directory (JON-5372). The first page reads fresh and keeps its sorted list;
+    // the pages after it, which carry a cursor, read from that snapshot for a short while.
+    const snapshotKey =
+      filter?.includeArchived && !scope
+        ? JSON.stringify([request.type, filter.labels ?? null, backgroundVisibility, sort])
+        : null;
+    const snapshot = this.agentsPageSnapshot;
+    const reusable =
+      snapshotKey !== null &&
+      request.page?.cursor !== undefined &&
+      snapshot?.key === snapshotKey &&
+      Date.now() - snapshot.at <= AGENTS_PAGE_SNAPSHOT_TTL_MS
+        ? snapshot
+        : null;
+    if (!reusable) this.agentsPageSnapshot = null;
+
+    let agents = reusable
+      ? reusable.sorted
+      : await this.listAgentPayloads({
+          labels: filter?.labels,
+          includeArchived: filter?.includeArchived,
+          includeBackground: backgroundVisibility,
+          includeUnavailablePersisted: request.type === "fetch_agent_history_request",
+        });
     const activePlacementsByWorkspaceId =
       scope === "active" ? await this.buildActiveProjectPlacementsByWorkspaceId() : null;
     if (activePlacementsByWorkspaceId) {
@@ -6271,7 +6292,12 @@ export class Session {
 
     const search = agentDirectorySearchQuery(request);
     let candidates = [...agents];
-    candidates.sort((left, right) => this.agentsPager.compare(left, right, sort));
+    if (!reusable) {
+      candidates.sort((left, right) => this.agentsPager.compare(left, right, sort));
+      if (snapshotKey !== null) {
+        this.agentsPageSnapshot = { key: snapshotKey, at: Date.now(), sorted: candidates };
+      }
+    }
     const cursorToken = request.page?.cursor;
     if (cursorToken) {
       const cursor = this.decodeAgentCursor(cursorToken, sort);
@@ -6306,6 +6332,8 @@ export class Session {
       },
     };
   }
+
+  private agentsPageSnapshot: { key: string; at: number; sorted: AgentSnapshotPayload[] } | null = null;
 
   private readonly agentsPager = new SortablePager<
     AgentSnapshotPayload,

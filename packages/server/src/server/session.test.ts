@@ -6442,6 +6442,74 @@ test("projects dormant heartbeat counts in directory snapshots and live updates"
   await session.cleanup();
 });
 
+test("pages an archived-inclusive directory from one snapshot and reads fresh on the first page", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const records = ["agent-a", "agent-b", "agent-c"].map((id, index) =>
+    createStoredAgentRecord({
+      id,
+      workspaceId: "workspace-a",
+      cwd: "/tmp/repo",
+      createdAt: `2026-01-01T00:00:0${index}.000Z`,
+    }),
+  );
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "workspace-a",
+    projectId: "project-a",
+    cwd: "/tmp/repo",
+    kind: "directory",
+    displayName: "Workspace",
+    createdAt: records[0].createdAt,
+    updatedAt: records[0].updatedAt,
+  });
+  const project = createPersistedProjectRecord({
+    projectId: workspace.projectId,
+    rootPath: workspace.cwd,
+    kind: "non_git",
+    displayName: "Project",
+    createdAt: records[0].createdAt,
+    updatedAt: records[0].updatedAt,
+  });
+  const providers = createProviderSnapshotManagerStub();
+  providers.listRegisteredProviderIds.mockReturnValue([records[0].provider]);
+  const listAll = vi.fn(async () => records);
+  const session = createSessionForTest({
+    messages,
+    providerSnapshotManager: providers.manager,
+    permissions: ["workspace.read"],
+    agentManager: { getAgent: () => undefined },
+    agentStorage: { get: async () => records[0], listAll },
+    workspaceRegistry: { get: vi.fn(async () => workspace) },
+    projectRegistry: { get: async () => project },
+  });
+
+  const read = async (requestId: string, cursor?: string) => {
+    messages.splice(0);
+    await session.handleMessage({
+      type: "fetch_agents_request",
+      requestId,
+      filter: { includeArchived: true },
+      sort: [{ key: "created_at", direction: "asc" }],
+      page: { limit: 1, ...(cursor ? { cursor } : {}) },
+    });
+    return findByType(messages, "fetch_agents_response")?.payload;
+  };
+
+  const seen: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 3; page += 1) {
+    const payload = await read(`page-${page}`, cursor);
+    seen.push(...(payload?.entries.map((entry) => entry.agent.id) ?? []));
+    cursor = payload?.pageInfo.nextCursor ?? undefined;
+  }
+  expect(seen).toEqual(["agent-a", "agent-b", "agent-c"]);
+  expect(cursor).toBeUndefined();
+  expect(listAll).toHaveBeenCalledTimes(1);
+
+  await read("fresh-first-page");
+  expect(listAll).toHaveBeenCalledTimes(2);
+  await session.cleanup();
+});
+
 test("reports an unavailable inventory for a stored agent without loading it", async () => {
   const messages: SessionOutboundMessage[] = [];
   const resumeAgentFromPersistence = vi.fn();
