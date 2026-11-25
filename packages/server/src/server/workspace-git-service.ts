@@ -53,6 +53,7 @@ import {
 } from "../utils/run-git-command.js";
 import type { GitProcessPriority } from "../utils/git-process-scheduler.js";
 import { GitObservationPaths } from "./git-observation-paths.js";
+import type { GitWorkerStats } from "./git-worker/client.js";
 import { branchNameFromRef } from "../utils/worktree-metadata.js";
 import { listPaseoWorktrees, type PaseoWorktreeInfo } from "../utils/worktree.js";
 import { READ_ONLY_GIT_ENV } from "./checkout-git-utils.js";
@@ -316,6 +317,7 @@ export interface WorkspaceGitServiceMetrics {
   snapshotUpdatedListenerCount: number;
   watcherErrorCallbackCount: number;
   fileObserver: FileObserverDiagnostics;
+  workerPool?: GitWorkerStats;
 }
 
 export type WorkspaceGitListener = (snapshot: WorkspaceGitRuntimeSnapshot) => void;
@@ -424,6 +426,7 @@ type WorkspaceGitRefreshState =
     };
 
 export interface WorkspaceGitServiceDependencies {
+  workerStats?: () => GitWorkerStats;
   subscribe: SubscribeToFileChanges;
   getCheckoutSnapshotFacts: typeof getCheckoutSnapshotFacts;
   getCheckoutRefDerivedState: typeof getCheckoutRefDerivedState;
@@ -855,6 +858,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       snapshotUpdatedListenerCount: this.snapshotUpdatedListeners.size,
       watcherErrorCallbackCount: this.watcherErrorCallbackCount,
       fileObserver: this.fileObserver.getDiagnostics(),
+      workerPool: this.deps.workerStats?.(),
     };
   }
 
