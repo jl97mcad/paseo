@@ -63,3 +63,7 @@ Prepare the handoff in a dedicated workspace:
 Do not encode independence as a create mode and do not invoke CLI or wire-level detach operations. Detach is a user gesture in the subagents track.
 
 Do not wait or poll for the agent to finish.
+
+## Retro
+
+Write the retro as a new file in the vault at `Notes/Agent learnings/<YYYY-MM-DD> <task> handover retro.md`, through the normal vault route. after handing over, before ending the current session, run /retro over this session and write the learnings to a new markdown file in my vault.
